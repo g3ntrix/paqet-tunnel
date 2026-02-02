@@ -238,36 +238,78 @@ download_paqet() {
     print_info "Downloading version: $version"
     print_info "URL: $download_url"
     
+    # Check for local file in /root/paqet first
+    local local_dir="/root/paqet"
+    local local_archive="$local_dir/$archive_name"
+    
     # Download and extract
     local temp_archive="/tmp/paqet.tar.gz"
     local download_success=false
     
-    if curl -fsSL "$download_url" -o "$temp_archive" 2>/dev/null; then
+    if [ -f "$local_archive" ]; then
+        print_success "Found local file: $local_archive"
+        cp "$local_archive" "$temp_archive"
         download_success=true
-    else
-        print_error "Failed to download paqet binary"
-        print_warning "Download blocked or network issue detected"
+    elif [ -d "$local_dir" ] && [ "$(ls -A $local_dir/*.tar.gz 2>/dev/null)" ]; then
+        # Found some tar.gz in /root/paqet, ask user
+        print_info "Found archives in $local_dir:"
+        ls -1 "$local_dir"/*.tar.gz 2>/dev/null
         echo ""
-        echo -e "${YELLOW}Do you have a local copy of the paqet archive? (y/n)${NC}"
-        read -p "> " has_local < /dev/tty
+        echo -e "${YELLOW}Use one of these files? (y/n)${NC}"
+        read -p "> " use_local < /dev/tty
         
-        if [[ "$has_local" =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}Enter the full path to the paqet tar.gz file:${NC}"
-            echo -e "${CYAN}Example: /root/paqet/paqet-linux-amd64-v1.0.0-alpha.11.tar.gz${NC}"
-            read -p "> " local_archive < /dev/tty
+        if [[ "$use_local" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Enter the filename (or full path):${NC}"
+            read -p "> " user_file < /dev/tty
             
-            if [ -f "$local_archive" ]; then
-                cp "$local_archive" "$temp_archive"
-                download_success=true
-                print_success "Using local file: $local_archive"
+            # Check if it's a full path or just filename
+            if [ -f "$user_file" ]; then
+                local_archive="$user_file"
+            elif [ -f "$local_dir/$user_file" ]; then
+                local_archive="$local_dir/$user_file"
             else
-                print_error "File not found: $local_archive"
+                print_error "File not found: $user_file"
                 exit 1
             fi
+            
+            cp "$local_archive" "$temp_archive"
+            download_success=true
+            print_success "Using local file: $local_archive"
+        fi
+    fi
+    
+    # Try downloading if no local file was used
+    if [ "$download_success" = false ]; then
+        print_info "Attempting download..."
+        if timeout 30 curl -fsSL "$download_url" -o "$temp_archive" 2>/dev/null; then
+            download_success=true
+            print_success "Download completed"
         else
-            print_info "Please download manually from: https://github.com/${GITHUB_REPO}/releases"
-            print_info "Then run this installer again"
-            exit 1
+            print_error "Failed to download paqet binary"
+            print_warning "Download blocked or network issue detected"
+            echo ""
+            echo -e "${YELLOW}Do you have a local copy of the paqet archive? (y/n)${NC}"
+            read -p "> " has_local < /dev/tty
+            
+            if [[ "$has_local" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}Enter the full path to the paqet tar.gz file:${NC}"
+                echo -e "${CYAN}Example: /root/paqet/paqet-linux-amd64-v1.0.0-alpha.11.tar.gz${NC}"
+                read -p "> " local_archive < /dev/tty
+                
+                if [ -f "$local_archive" ]; then
+                    cp "$local_archive" "$temp_archive"
+                    download_success=true
+                    print_success "Using local file: $local_archive"
+                else
+                    print_error "File not found: $local_archive"
+                    exit 1
+                fi
+            else
+                print_info "Please download manually from: https://github.com/${GITHUB_REPO}/releases"
+                print_info "Save to: $local_dir/"
+                print_info "Then run this installer again"
+                exit 1
+            fi
         fi
     fi
     
