@@ -11,13 +11,22 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.3.0"
+INSTALLER_VERSION="1.4.0"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
 PAQET_BIN="$PAQET_DIR/paqet"
 PAQET_SERVICE="paqet"
 GITHUB_REPO="hanselime/paqet"
+INSTALLER_REPO="g3ntrix/paqet-tunnel"
+
+#===============================================================================
+# Default Port Configuration (Easy to change)
+#===============================================================================
+DEFAULT_PAQET_PORT="8888"           # Port for paqet tunnel communication
+DEFAULT_FORWARD_PORTS="9090"        # Default ports to forward (comma-separated)
+DEFAULT_KCP_MODE="fast"             # KCP mode: normal, fast, fast2, fast3
+DEFAULT_KCP_CONN="1"                # Number of parallel connections
 
 # Colors
 RED='\033[0;31m'
@@ -53,6 +62,254 @@ print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info() { echo -e "${CYAN}[i]${NC} $1"; }
+
+#===============================================================================
+# Input Validation Functions (with retry on invalid input)
+#===============================================================================
+
+# Read required input - keeps asking until valid input is provided
+# Usage: read_required "prompt" "variable_name" ["default_value"]
+read_required() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate non-empty
+        if [ -n "$value" ]; then
+            eval "$varname='$value'"
+            return 0
+        else
+            print_error "This field is required. Please enter a value."
+            echo ""
+        fi
+    done
+}
+
+# Read IP address with validation
+# Usage: read_ip "prompt" "variable_name" ["default_value"]
+read_ip() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    local ip_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate IP format
+        if [ -z "$value" ]; then
+            print_error "IP address is required. Please enter a valid IP."
+            echo ""
+        elif ! [[ "$value" =~ $ip_regex ]]; then
+            print_error "Invalid IP format. Please enter a valid IPv4 address (e.g., 192.168.1.1)"
+            echo ""
+        else
+            eval "$varname='$value'"
+            return 0
+        fi
+    done
+}
+
+# Read port number with validation
+# Usage: read_port "prompt" "variable_name" ["default_value"]
+read_port() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate port number
+        if [ -z "$value" ]; then
+            print_error "Port number is required."
+            echo ""
+        elif ! [[ "$value" =~ ^[0-9]+$ ]]; then
+            print_error "Invalid port. Please enter a number."
+            echo ""
+        elif [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+            print_error "Port must be between 1 and 65535."
+            echo ""
+        else
+            eval "$varname='$value'"
+            return 0
+        fi
+    done
+}
+
+# Read port list with validation (comma-separated)
+# Usage: read_ports "prompt" "variable_name" ["default_value"]
+read_ports() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate port list
+        if [ -z "$value" ]; then
+            print_error "At least one port is required."
+            echo ""
+            continue
+        fi
+        
+        # Validate each port in the comma-separated list
+        local valid=true
+        IFS=',' read -ra ports <<< "$value"
+        for port in "${ports[@]}"; do
+            port=$(echo "$port" | tr -d ' ')
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                print_error "Invalid port: $port. Each port must be a number between 1-65535."
+                valid=false
+                break
+            fi
+        done
+        
+        if [ "$valid" = true ]; then
+            eval "$varname='$value'"
+            return 0
+        fi
+        echo ""
+    done
+}
+
+# Read MAC address with validation
+# Usage: read_mac "prompt" "variable_name" ["default_value"]
+read_mac() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    local mac_regex='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+    
+    while true; do
+        if [ -n "$default" ]; then
+            echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if provided and input is empty
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        # Validate MAC format
+        if [ -z "$value" ]; then
+            print_error "MAC address is required."
+            echo ""
+        elif ! [[ "$value" =~ $mac_regex ]]; then
+            print_error "Invalid MAC format. Please use format: aa:bb:cc:dd:ee:ff"
+            echo ""
+        else
+            eval "$varname='$value'"
+            return 0
+        fi
+    done
+}
+
+# Read yes/no confirmation
+# Usage: read_confirm "prompt" "variable_name" ["default_y_or_n"]
+read_confirm() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    while true; do
+        if [ "$default" = "y" ]; then
+            echo -e "${YELLOW}${prompt} (Y/n):${NC}"
+        elif [ "$default" = "n" ]; then
+            echo -e "${YELLOW}${prompt} (y/N):${NC}"
+        else
+            echo -e "${YELLOW}${prompt} (y/n):${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        # Use default if input is empty and default is provided
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        case "$value" in
+            [Yy]|[Yy][Ee][Ss]) eval "$varname=true"; return 0 ;;
+            [Nn]|[Nn][Oo]) eval "$varname=false"; return 0 ;;
+            *) print_error "Please enter 'y' for yes or 'n' for no."; echo "" ;;
+        esac
+    done
+}
+
+# Read optional input - allows empty value
+# Usage: read_optional "prompt" "variable_name" ["default_value"]
+read_optional() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    if [ -n "$default" ]; then
+        echo -e "${YELLOW}${prompt} [${default}]:${NC}"
+    else
+        echo -e "${YELLOW}${prompt} (optional):${NC}"
+    fi
+    read -p "> " value < /dev/tty
+    
+    # Use default if input is empty
+    if [ -z "$value" ] && [ -n "$default" ]; then
+        value="$default"
+    fi
+    
+    eval "$varname='$value'"
+}
 
 #===============================================================================
 # System Detection Functions
@@ -422,51 +679,43 @@ setup_server_b() {
     echo -e "  Gateway MAC: ${CYAN}$gateway_mac${NC}"
     echo ""
     
-    # Confirm or modify interface
-    echo -e "${YELLOW}Network interface [${interface}]:${NC}"
-    read -p "> " input_interface < /dev/tty
-    [ -n "$input_interface" ] && interface="$input_interface"
+    # Confirm or modify interface (with validation)
+    read_required "Network interface" interface "$interface"
     
-    # Get local IP for that interface
+    # Get local IP for that interface (with validation)
     local_ip=$(get_local_ip "$interface")
     if [ -z "$local_ip" ]; then
-        echo -e "${YELLOW}Could not detect IP. Enter local IP:${NC}"
-        read -p "> " local_ip < /dev/tty
+        read_ip "Could not detect IP. Enter local IP" local_ip
+    else
+        read_optional "Local IP" local_ip "$local_ip"
     fi
     
-    # Confirm gateway MAC
+    # Confirm gateway MAC (with validation)
     if [ -z "$gateway_mac" ]; then
-        echo -e "${YELLOW}Could not detect gateway MAC. Enter gateway MAC address:${NC}"
-        read -p "> " gateway_mac < /dev/tty
+        read_mac "Could not detect gateway MAC. Enter gateway MAC address" gateway_mac
     else
-        echo -e "${YELLOW}Gateway MAC [${gateway_mac}]:${NC}"
-        read -p "> " input_mac < /dev/tty
+        read_optional "Gateway MAC" input_mac "$gateway_mac"
         [ -n "$input_mac" ] && gateway_mac="$input_mac"
     fi
     
-    # paqet listen port
+    # paqet listen port (with validation)
     echo ""
-    echo -e "${YELLOW}Enter paqet listen port (for tunnel, NOT your V2Ray ports):${NC}"
-    read -p "Port [8888]: " PAQET_PORT < /dev/tty
-    [ -z "$PAQET_PORT" ] && PAQET_PORT="8888"
+    echo -e "${CYAN}Enter paqet listen port (for tunnel, NOT your V2Ray ports)${NC}"
+    read_port "paqet listen port" PAQET_PORT "$DEFAULT_PAQET_PORT"
     
     # Check port conflict
     check_port_conflict "$PAQET_PORT"
     
-    # V2Ray ports to forward
+    # V2Ray ports to forward (with validation)
     echo ""
-    echo -e "${YELLOW}Enter V2Ray inbound ports (comma-separated):${NC}"
     echo -e "${CYAN}These are the ports your V2Ray/X-UI listens on${NC}"
-    read -p "Ports [9090]: " INBOUND_PORTS < /dev/tty
-    [ -z "$INBOUND_PORTS" ] && INBOUND_PORTS="9090"
+    read_ports "Enter V2Ray inbound ports (comma-separated)" INBOUND_PORTS "$DEFAULT_FORWARD_PORTS"
     
     # Generate or input secret key
     echo ""
     local secret_key=$(generate_secret_key)
-    echo -e "${YELLOW}Generated secret key (or enter your own):${NC}"
-    echo -e "${CYAN}$secret_key${NC}"
-    read -p "Key [$secret_key]: " input_key < /dev/tty
-    [ -n "$input_key" ] && secret_key="$input_key"
+    echo -e "${CYAN}Generated secret key: $secret_key${NC}"
+    read_required "Secret key (press Enter to use generated)" secret_key "$secret_key"
     
     # Download paqet
     download_paqet
@@ -559,50 +808,40 @@ setup_server_a() {
     echo -e "  Gateway MAC: ${CYAN}$gateway_mac${NC}"
     echo ""
     
-    # Get Server B details
-    echo -e "${YELLOW}Enter Server B (Abroad) public IP:${NC}"
-    read -p "IP: " SERVER_B_IP < /dev/tty
-    [ -z "$SERVER_B_IP" ] && { print_error "Server B IP required"; exit 1; }
+    # Get Server B details (with validation - keeps asking until valid)
+    echo -e "${CYAN}Enter Server B (Abroad) connection details${NC}"
+    read_ip "Server B public IP address" SERVER_B_IP
     
     echo ""
-    echo -e "${YELLOW}Enter paqet port on Server B:${NC}"
-    read -p "Port [8888]: " SERVER_B_PORT < /dev/tty
-    [ -z "$SERVER_B_PORT" ] && SERVER_B_PORT="8888"
+    read_port "paqet port on Server B" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
     
     echo ""
-    echo -e "${YELLOW}Enter secret key (from Server B setup):${NC}"
-    read -p "Key: " SECRET_KEY < /dev/tty
-    [ -z "$SECRET_KEY" ] && { print_error "Secret key required"; exit 1; }
+    read_required "Secret key (from Server B setup)" SECRET_KEY
     
-    # Confirm or modify interface
+    # Confirm or modify interface (with validation)
     echo ""
-    echo -e "${YELLOW}Network interface [${interface}]:${NC}"
-    read -p "> " input_interface < /dev/tty
-    [ -n "$input_interface" ] && interface="$input_interface"
+    read_required "Network interface" interface "$interface"
     
-    # Get local IP for that interface
+    # Get local IP for that interface (with validation)
     local_ip=$(get_local_ip "$interface")
     if [ -z "$local_ip" ]; then
-        echo -e "${YELLOW}Could not detect IP. Enter local IP:${NC}"
-        read -p "> " local_ip < /dev/tty
+        read_ip "Could not detect IP. Enter local IP" local_ip
+    else
+        read_optional "Local IP" local_ip "$local_ip"
     fi
     
-    # Confirm gateway MAC
+    # Confirm gateway MAC (with validation)
     if [ -z "$gateway_mac" ]; then
-        echo -e "${YELLOW}Could not detect gateway MAC. Enter gateway MAC address:${NC}"
-        read -p "> " gateway_mac < /dev/tty
+        read_mac "Could not detect gateway MAC. Enter gateway MAC address" gateway_mac
     else
-        echo -e "${YELLOW}Gateway MAC [${gateway_mac}]:${NC}"
-        read -p "> " input_mac < /dev/tty
+        read_optional "Gateway MAC" input_mac "$gateway_mac"
         [ -n "$input_mac" ] && gateway_mac="$input_mac"
     fi
     
-    # Ports to forward
+    # Ports to forward (with validation)
     echo ""
-    echo -e "${YELLOW}Enter ports to forward (comma-separated):${NC}"
     echo -e "${CYAN}These will be accessible on this server and forwarded to Server B${NC}"
-    read -p "Ports [9090]: " FORWARD_PORTS < /dev/tty
-    [ -z "$FORWARD_PORTS" ] && FORWARD_PORTS="9090"
+    read_ports "Enter ports to forward (comma-separated)" FORWARD_PORTS "$DEFAULT_FORWARD_PORTS"
     
     # Check port conflicts
     echo ""
@@ -810,6 +1049,542 @@ view_config() {
 }
 
 #===============================================================================
+# Edit Configuration
+#===============================================================================
+
+edit_config() {
+    print_banner
+    echo -e "${YELLOW}Edit Configuration${NC}"
+    echo ""
+    
+    if [ ! -f "$PAQET_CONFIG" ]; then
+        print_error "Configuration not found at $PAQET_CONFIG"
+        print_info "Please run setup first"
+        return 1
+    fi
+    
+    # Detect current role
+    local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    
+    echo -e "Current role: ${CYAN}$role${NC}"
+    echo ""
+    echo -e "${YELLOW}What would you like to edit?${NC}"
+    echo ""
+    echo -e "  ${CYAN}1)${NC} Change ports"
+    echo -e "  ${CYAN}2)${NC} Change secret key"
+    echo -e "  ${CYAN}3)${NC} Change KCP settings"
+    echo -e "  ${CYAN}4)${NC} Change network interface"
+    if [ "$role" = "client" ]; then
+        echo -e "  ${CYAN}5)${NC} Change Server B address"
+    fi
+    echo -e "  ${CYAN}0)${NC} Back to main menu"
+    echo ""
+    
+    read -p "Choice: " edit_choice < /dev/tty
+    
+    case $edit_choice in
+        1) edit_ports "$role" ;;
+        2) edit_secret_key ;;
+        3) edit_kcp_settings ;;
+        4) edit_interface ;;
+        5) 
+            if [ "$role" = "client" ]; then
+                edit_server_address
+            else
+                print_error "Invalid choice"
+            fi
+            ;;
+        0) return 0 ;;
+        *) print_error "Invalid choice" ;;
+    esac
+}
+
+edit_ports() {
+    local role=$1
+    echo ""
+    
+    if [ "$role" = "server" ]; then
+        local current_port=$(grep -A1 "^listen:" "$PAQET_CONFIG" | grep "addr:" | sed 's/.*:\([0-9]*\)".*/\1/')
+        read_port "Enter new paqet listen port" NEW_PORT "$current_port"
+        
+        # Update config file
+        sed -i "s/addr: \":[0-9]*\"/addr: \":${NEW_PORT}\"/" "$PAQET_CONFIG"
+        
+        # Update iptables
+        setup_iptables "$NEW_PORT"
+        
+        print_success "Port updated to $NEW_PORT"
+    else
+        echo -e "${CYAN}Current forward configuration:${NC}"
+        grep -A3 "^forward:" "$PAQET_CONFIG" | head -10
+        echo ""
+        
+        read_ports "Enter new forward ports (comma-separated)" NEW_PORTS "$DEFAULT_FORWARD_PORTS"
+        
+        # Rebuild forward section
+        local forward_config=""
+        IFS=',' read -ra PORTS <<< "$NEW_PORTS"
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | tr -d ' ')
+            forward_config="${forward_config}
+  - listen: \"0.0.0.0:${port}\"
+    target: \"127.0.0.1:${port}\"
+    protocol: \"tcp\""
+        done
+        
+        # Use awk to replace the forward section
+        awk -v new_forward="forward:${forward_config}" '
+            /^forward:/ { in_forward=1; print new_forward; next }
+            in_forward && /^[a-z]/ { in_forward=0 }
+            !in_forward { print }
+        ' "$PAQET_CONFIG" > "${PAQET_CONFIG}.tmp"
+        mv "${PAQET_CONFIG}.tmp" "$PAQET_CONFIG"
+        
+        print_success "Forward ports updated"
+    fi
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+edit_secret_key() {
+    echo ""
+    local new_key=$(generate_secret_key)
+    echo -e "${CYAN}Generated new key: $new_key${NC}"
+    read_required "Enter new secret key (or use generated)" SECRET_KEY "$new_key"
+    
+    sed -i "s/key: \"[^\"]*\"/key: \"${SECRET_KEY}\"/" "$PAQET_CONFIG"
+    print_success "Secret key updated"
+    
+    print_warning "Remember to update the key on the other server as well!"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+edit_kcp_settings() {
+    echo ""
+    echo -e "${YELLOW}KCP Mode options:${NC}"
+    echo -e "  ${CYAN}normal${NC}  - Balanced (default)"
+    echo -e "  ${CYAN}fast${NC}    - Low latency"
+    echo -e "  ${CYAN}fast2${NC}   - Lower latency"
+    echo -e "  ${CYAN}fast3${NC}   - Aggressive, best for high latency"
+    echo ""
+    
+    local current_mode=$(grep "mode:" "$PAQET_CONFIG" | awk '{print $2}' | tr -d '"')
+    read_required "Enter KCP mode" KCP_MODE "$current_mode"
+    
+    local current_conn=$(grep "conn:" "$PAQET_CONFIG" | awk '{print $2}')
+    read_required "Enter number of parallel connections (1-8)" KCP_CONN "$current_conn"
+    
+    sed -i "s/mode: \"[^\"]*\"/mode: \"${KCP_MODE}\"/" "$PAQET_CONFIG"
+    sed -i "s/conn: [0-9]*/conn: ${KCP_CONN}/" "$PAQET_CONFIG"
+    
+    print_success "KCP settings updated"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+edit_interface() {
+    echo ""
+    local current_iface=$(grep "interface:" "$PAQET_CONFIG" | awk '{print $2}' | tr -d '"')
+    echo -e "Current interface: ${CYAN}$current_iface${NC}"
+    echo ""
+    echo -e "${YELLOW}Available interfaces:${NC}"
+    ip -o link show | awk -F': ' '{print "  " $2}'
+    echo ""
+    
+    read_required "Enter network interface" NEW_IFACE "$current_iface"
+    
+    local new_ip=$(get_local_ip "$NEW_IFACE")
+    if [ -z "$new_ip" ]; then
+        read_ip "Could not detect IP. Enter local IP for $NEW_IFACE" new_ip
+    fi
+    
+    local new_mac=$(get_gateway_mac)
+    if [ -z "$new_mac" ]; then
+        read_mac "Enter gateway MAC address" new_mac
+    fi
+    
+    sed -i "s/interface: \"[^\"]*\"/interface: \"${NEW_IFACE}\"/" "$PAQET_CONFIG"
+    sed -i "s/router_mac: \"[^\"]*\"/router_mac: \"${new_mac}\"/" "$PAQET_CONFIG"
+    # Update IP in addr field (keeping the port)
+    sed -i "s|addr: \"[0-9.]*:|addr: \"${new_ip}:|" "$PAQET_CONFIG"
+    
+    print_success "Network interface updated"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+edit_server_address() {
+    echo ""
+    local current_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" | grep "addr:" | awk '{print $2}' | tr -d '"')
+    local current_ip=$(echo "$current_addr" | cut -d':' -f1)
+    local current_port=$(echo "$current_addr" | cut -d':' -f2)
+    
+    echo -e "Current Server B: ${CYAN}$current_addr${NC}"
+    echo ""
+    
+    read_ip "Enter Server B IP address" NEW_SERVER_IP "$current_ip"
+    read_port "Enter Server B paqet port" NEW_SERVER_PORT "$current_port"
+    
+    sed -i "s|addr: \"${current_addr}\"|addr: \"${NEW_SERVER_IP}:${NEW_SERVER_PORT}\"|" "$PAQET_CONFIG"
+    
+    print_success "Server B address updated to ${NEW_SERVER_IP}:${NEW_SERVER_PORT}"
+    
+    echo ""
+    read_confirm "Restart paqet service to apply changes?" restart_now "y"
+    if [ "$restart_now" = true ]; then
+        systemctl restart $PAQET_SERVICE
+        print_success "Service restarted"
+    fi
+}
+
+#===============================================================================
+# Connection Test Tool
+#===============================================================================
+
+test_connection() {
+    print_banner
+    echo -e "${YELLOW}Connection Test Tool${NC}"
+    echo ""
+    
+    if [ ! -f "$PAQET_CONFIG" ]; then
+        print_error "paqet is not configured on this server"
+        print_info "Please run setup first"
+        return 1
+    fi
+    
+    local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    
+    echo -e "Detected role: ${CYAN}$role${NC}"
+    echo ""
+    
+    # Check if service is running
+    print_step "Checking paqet service..."
+    if systemctl is-active --quiet $PAQET_SERVICE 2>/dev/null; then
+        print_success "paqet service is running"
+    else
+        print_error "paqet service is NOT running"
+        echo ""
+        read_confirm "Would you like to start it?" start_svc "y"
+        if [ "$start_svc" = true ]; then
+            systemctl start $PAQET_SERVICE
+            sleep 2
+            if systemctl is-active --quiet $PAQET_SERVICE; then
+                print_success "Service started"
+            else
+                print_error "Failed to start service"
+                echo -e "${YELLOW}Check logs:${NC} journalctl -u $PAQET_SERVICE -n 20"
+                return 1
+            fi
+        else
+            return 1
+        fi
+    fi
+    
+    echo ""
+    
+    if [ "$role" = "server" ]; then
+        # Server B tests
+        test_server_b
+    else
+        # Server A tests
+        test_server_a
+    fi
+}
+
+test_server_b() {
+    echo -e "${GREEN}Running Server B (Abroad) tests...${NC}"
+    echo ""
+    
+    local listen_port=$(grep -A1 "^listen:" "$PAQET_CONFIG" | grep "addr:" | sed 's/.*:\([0-9]*\)".*/\1/')
+    
+    # Test 1: Check if paqet is listening
+    print_step "Test 1: Checking if paqet is listening on port $listen_port..."
+    if ss -tuln | grep -q ":${listen_port} "; then
+        print_success "paqet is listening on port $listen_port"
+    else
+        print_warning "paqet might be using raw sockets (not visible in ss)"
+        print_info "This is normal for paqet"
+    fi
+    
+    echo ""
+    
+    # Test 2: Check iptables rules
+    print_step "Test 2: Checking iptables rules..."
+    local raw_rules=$(iptables -t raw -L -n 2>/dev/null | grep -c "$listen_port" || echo "0")
+    local mangle_rules=$(iptables -t mangle -L -n 2>/dev/null | grep -c "$listen_port" || echo "0")
+    
+    if [ "$raw_rules" -gt 0 ] && [ "$mangle_rules" -gt 0 ]; then
+        print_success "iptables rules are configured"
+    else
+        print_warning "Some iptables rules may be missing"
+        print_info "Run setup again to reconfigure"
+    fi
+    
+    echo ""
+    
+    # Test 3: Check for recent connections in logs
+    print_step "Test 3: Checking recent activity..."
+    local recent_logs=$(journalctl -u $PAQET_SERVICE --since "5 minutes ago" 2>/dev/null | tail -5)
+    if [ -n "$recent_logs" ]; then
+        echo "$recent_logs"
+    else
+        print_info "No recent activity in logs"
+    fi
+    
+    echo ""
+    
+    # Test 4: External connectivity check
+    print_step "Test 4: Checking external connectivity..."
+    if curl -s --max-time 5 ifconfig.me >/dev/null 2>&1; then
+        local public_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null)
+        print_success "External connectivity OK (Public IP: $public_ip)"
+    else
+        print_warning "Cannot reach external services"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Server B Checklist:${NC}"
+    echo -e "  • Ensure port ${CYAN}$listen_port${NC} is open in cloud firewall"
+    echo -e "  • Ensure V2Ray/X-UI listens on ${CYAN}0.0.0.0${NC}"
+    echo -e "  • Share the secret key with Server A"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+}
+
+test_server_a() {
+    echo -e "${GREEN}Running Server A (Iran/Entry Point) tests...${NC}"
+    echo ""
+    
+    local server_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" | grep "addr:" | awk '{print $2}' | tr -d '"')
+    local server_ip=$(echo "$server_addr" | cut -d':' -f1)
+    local server_port=$(echo "$server_addr" | cut -d':' -f2)
+    
+    echo -e "Target Server B: ${CYAN}$server_addr${NC}"
+    echo ""
+    
+    # Test 1: Basic network connectivity
+    print_step "Test 1: Basic network connectivity to Server B..."
+    if ping -c 1 -W 3 "$server_ip" >/dev/null 2>&1; then
+        print_success "Server B is reachable via ICMP"
+    else
+        print_warning "ICMP blocked (this may be normal)"
+    fi
+    
+    echo ""
+    
+    # Test 2: TCP connectivity to paqet port
+    print_step "Test 2: TCP connectivity to Server B port $server_port..."
+    if timeout 5 bash -c "echo >/dev/tcp/$server_ip/$server_port" 2>/dev/null; then
+        print_success "Port $server_port is reachable"
+    else
+        # Try with nc if available
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z -w 5 "$server_ip" "$server_port" 2>/dev/null; then
+                print_success "Port $server_port is reachable"
+            else
+                print_error "Cannot reach Server B on port $server_port"
+                print_info "Check: 1) Server B paqet is running 2) Firewall allows port $server_port"
+            fi
+        else
+            print_warning "Cannot test TCP (nc not available)"
+            print_info "Install netcat: apt install netcat-openbsd"
+        fi
+    fi
+    
+    echo ""
+    
+    # Test 3: Check forwarded ports
+    print_step "Test 3: Checking forwarded ports..."
+    local forward_ports=$(grep -A10 "^forward:" "$PAQET_CONFIG" | grep "listen:" | sed 's/.*:\([0-9]*\)".*/\1/' | tr '\n' ' ')
+    
+    for port in $forward_ports; do
+        if ss -tuln | grep -q ":${port} "; then
+            print_success "Port $port is listening"
+        else
+            print_warning "Port $port may be using raw sockets"
+        fi
+    done
+    
+    echo ""
+    
+    # Test 4: Check recent tunnel activity
+    print_step "Test 4: Checking tunnel activity..."
+    local recent_logs=$(journalctl -u $PAQET_SERVICE --since "5 minutes ago" 2>/dev/null | grep -iE "connect|tunnel|forward" | tail -3)
+    if [ -n "$recent_logs" ]; then
+        echo "$recent_logs"
+    else
+        print_info "No recent tunnel activity"
+    fi
+    
+    echo ""
+    
+    # Test 5: End-to-end test (if user wants)
+    echo -e "${YELLOW}Would you like to run an end-to-end test?${NC}"
+    echo -e "${CYAN}This will attempt to connect through the tunnel.${NC}"
+    read_confirm "Run end-to-end test?" run_e2e "n"
+    
+    if [ "$run_e2e" = true ]; then
+        echo ""
+        local test_port=$(echo "$forward_ports" | awk '{print $1}')
+        print_step "Attempting connection through tunnel on port $test_port..."
+        
+        if timeout 10 bash -c "echo >/dev/tcp/127.0.0.1/$test_port" 2>/dev/null; then
+            print_success "Tunnel connection successful!"
+        else
+            print_error "Tunnel connection failed"
+            print_info "Check logs: journalctl -u $PAQET_SERVICE -f"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Server A Checklist:${NC}"
+    echo -e "  • Verify secret key matches Server B"
+    echo -e "  • Ensure Server B's paqet port is reachable"
+    echo -e "  • Update V2Ray clients to use this server's IP"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+}
+
+#===============================================================================
+# Auto-Updater
+#===============================================================================
+
+check_for_updates() {
+    print_banner
+    echo -e "${YELLOW}Checking for Updates${NC}"
+    echo ""
+    
+    print_step "Current version: ${CYAN}$INSTALLER_VERSION${NC}"
+    echo ""
+    
+    print_step "Fetching latest version from GitHub..."
+    
+    # Get latest version from GitHub
+    local latest_version=""
+    local release_info=""
+    
+    release_info=$(curl -s --max-time 10 "https://api.github.com/repos/${INSTALLER_REPO}/releases/latest" 2>/dev/null)
+    
+    if [ -z "$release_info" ]; then
+        # Try fetching from raw main branch
+        latest_version=$(curl -s --max-time 10 "https://raw.githubusercontent.com/${INSTALLER_REPO}/main/install.sh" 2>/dev/null | grep '^INSTALLER_VERSION=' | cut -d'"' -f2)
+    else
+        latest_version=$(echo "$release_info" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    fi
+    
+    if [ -z "$latest_version" ]; then
+        print_error "Could not fetch version information"
+        print_info "This may be due to network restrictions"
+        echo ""
+        echo -e "${YELLOW}Manual update:${NC}"
+        echo -e "  ${CYAN}bash <(curl -fsSL https://raw.githubusercontent.com/${INSTALLER_REPO}/main/install.sh)${NC}"
+        return 1
+    fi
+    
+    print_info "Latest version: ${CYAN}$latest_version${NC}"
+    echo ""
+    
+    # Compare versions (simple string comparison)
+    if [ "$INSTALLER_VERSION" = "$latest_version" ]; then
+        print_success "You are running the latest version!"
+        return 0
+    fi
+    
+    # Version is different (could be newer or older)
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}A new version is available!${NC}"
+    echo -e "  Current: ${RED}$INSTALLER_VERSION${NC}"
+    echo -e "  Latest:  ${GREEN}$latest_version${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    read_confirm "Would you like to update now?" do_update "y"
+    
+    if [ "$do_update" = true ]; then
+        update_installer
+    fi
+}
+
+update_installer() {
+    print_step "Downloading latest installer..."
+    
+    local temp_script="/tmp/paqet_install_new.sh"
+    local download_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/main/install.sh"
+    
+    if curl -fsSL "$download_url" -o "$temp_script" 2>/dev/null; then
+        chmod +x "$temp_script"
+        
+        # Verify the downloaded script
+        if grep -q "INSTALLER_VERSION" "$temp_script"; then
+            local new_version=$(grep '^INSTALLER_VERSION=' "$temp_script" | cut -d'"' -f2)
+            print_success "Downloaded version: $new_version"
+            
+            # Backup current config if exists
+            if [ -f "$PAQET_CONFIG" ]; then
+                cp "$PAQET_CONFIG" "${PAQET_CONFIG}.backup"
+                print_info "Configuration backed up to ${PAQET_CONFIG}.backup"
+            fi
+            
+            echo ""
+            print_step "Launching updated installer..."
+            echo ""
+            
+            # Execute the new script
+            exec bash "$temp_script"
+        else
+            print_error "Downloaded file doesn't appear to be valid"
+            rm -f "$temp_script"
+            return 1
+        fi
+    else
+        print_error "Failed to download update"
+        print_info "Network may be restricted. Try manual update:"
+        echo -e "  ${CYAN}bash <(curl -fsSL $download_url)${NC}"
+        return 1
+    fi
+}
+
+#===============================================================================
+# Quick Port Configuration Display
+#===============================================================================
+
+show_port_config() {
+    echo ""
+    echo -e "${MAGENTA}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}              Current Port Configuration                    ${NC}"
+    echo -e "${MAGENTA}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${YELLOW}Default paqet port:${NC}     ${CYAN}$DEFAULT_PAQET_PORT${NC}"
+    echo -e "  ${YELLOW}Default forward ports:${NC}  ${CYAN}$DEFAULT_FORWARD_PORTS${NC}"
+    echo -e "  ${YELLOW}KCP mode:${NC}               ${CYAN}$DEFAULT_KCP_MODE${NC}"
+    echo -e "  ${YELLOW}KCP connections:${NC}        ${CYAN}$DEFAULT_KCP_CONN${NC}"
+    echo -e "${MAGENTA}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${CYAN}To change defaults, edit the script header configuration section.${NC}"
+    echo ""
+}
+
+#===============================================================================
 # Main Menu
 #===============================================================================
 
@@ -821,22 +1596,35 @@ main() {
         
         echo -e "${YELLOW}Select option:${NC}"
         echo ""
+        echo -e "  ${GREEN}── Setup ──${NC}"
         echo -e "  ${CYAN}1)${NC} Setup Server B (Abroad - VPN server)"
         echo -e "  ${CYAN}2)${NC} Setup Server A (Iran - entry point)"
+        echo ""
+        echo -e "  ${GREEN}── Management ──${NC}"
         echo -e "  ${CYAN}3)${NC} Check Status"
         echo -e "  ${CYAN}4)${NC} View Configuration"
-        echo -e "  ${CYAN}5)${NC} Uninstall"
-        echo -e "  ${CYAN}6)${NC} Exit"
+        echo -e "  ${CYAN}5)${NC} Edit Configuration"
+        echo -e "  ${CYAN}6)${NC} Test Connection"
         echo ""
-        read -p "Choice [1-6]: " choice < /dev/tty
+        echo -e "  ${GREEN}── Maintenance ──${NC}"
+        echo -e "  ${CYAN}7)${NC} Check for Updates"
+        echo -e "  ${CYAN}8)${NC} Show Port Defaults"
+        echo -e "  ${CYAN}9)${NC} Uninstall"
+        echo -e "  ${CYAN}0)${NC} Exit"
+        echo ""
+        read -p "Choice [0-9]: " choice < /dev/tty
         
         case $choice in
             1) install_dependencies; setup_server_b ;;
             2) install_dependencies; setup_server_a ;;
             3) check_status ;;
             4) view_config ;;
-            5) uninstall ;;
-            6) exit 0 ;;
+            5) edit_config ;;
+            6) test_connection ;;
+            7) check_for_updates ;;
+            8) show_port_config ;;
+            9) uninstall ;;
+            0) exit 0 ;;
             *) print_error "Invalid choice" ;;
         esac
         
