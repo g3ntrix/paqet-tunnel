@@ -1542,14 +1542,21 @@ check_for_updates() {
     # Get latest version from GitHub
     local latest_version=""
     local release_info=""
+    local raw_script=""
     
+    # Method 1: Try GitHub releases API
     release_info=$(curl -s --max-time 10 "https://api.github.com/repos/${INSTALLER_REPO}/releases/latest" 2>/dev/null)
-    
-    if [ -z "$release_info" ]; then
-        # Try fetching from raw main branch
-        latest_version=$(curl -s --max-time 10 "https://raw.githubusercontent.com/${INSTALLER_REPO}/main/install.sh" 2>/dev/null | grep '^INSTALLER_VERSION=' | cut -d'"' -f2)
-    else
+    if [ -n "$release_info" ]; then
         latest_version=$(echo "$release_info" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    fi
+    
+    # Method 2: If no release found, fetch from raw main branch
+    if [ -z "$latest_version" ]; then
+        print_info "No releases found, checking main branch..."
+        raw_script=$(curl -s --max-time 15 "https://raw.githubusercontent.com/${INSTALLER_REPO}/main/install.sh" 2>/dev/null)
+        if [ -n "$raw_script" ]; then
+            latest_version=$(echo "$raw_script" | grep 'INSTALLER_VERSION=' | head -1 | cut -d'"' -f2)
+        fi
     fi
     
     if [ -z "$latest_version" ]; then
