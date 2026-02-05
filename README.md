@@ -2,14 +2,14 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.5.0
+**Current Version:** v1.5.1
 
 ## Features
 
 - **Interactive Setup** - Guided installation for both Iran and abroad servers
 - **Input Validation** - Won't exit on invalid input, keeps asking until valid
 - **Iran Network Optimization** - Optional DNS and apt mirror optimization for Iran servers
-- **Configuration Editor** - Change ports, keys, and settings without manual file editing
+- **Configuration Editor** - Change ports, keys, KCP settings, and MTU without manual file editing
 - **Connection Test Tool** - Built-in diagnostics to verify tunnel connectivity
 - **Auto-Updater** - Check for and install updates from within the script
 - **Smart Defaults** - Sensible defaults with easy customization
@@ -157,8 +157,23 @@ When running the installer, choose **'s'** to skip dependency installation when 
 
 ## Performance Optimization
 
+The default settings are conservative. For better speed or to fix EOF/MTU issues, you can tune KCP from the menu or manually:
 
-The default settings are conservative. For better speed, edit `/opt/paqet/config.yaml` on **both servers** and add these KCP optimizations:
+### Via Menu (Recommended)
+
+On **both servers**, run the installer and choose:
+
+- **Option 5** → **Edit Configuration**
+- Then **Option 3** → **KCP Settings**
+
+You can adjust:
+- **Mode**: `normal`, `fast`, `fast2`, `fast3`
+- **Connections**: number of parallel KCP connections
+- **MTU**: default `1350` (try `1280-1300` on problematic networks)
+
+### Manual Tuning Example
+
+Edit `/opt/paqet/config.yaml` on **both servers**:
 
 ```yaml
 transport:
@@ -167,7 +182,7 @@ transport:
   kcp:
     mode: "fast3"            # Aggressive retransmission
     key: "YOUR_SECRET_KEY"
-    mtu: 1400
+    mtu: 1350                # Lower for restrictive networks (1280–1400)
     snd_wnd: 2048            # Large send window
     rcv_wnd: 2048            # Large receive window
     data_shard: 10           # FEC error correction
