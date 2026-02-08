@@ -2,9 +2,14 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.8.0
+**Current Version:** v1.9.0
 
 ## Changelog
+
+### v1.9.0
+- **Automatic Reset** - Option (a) for scheduled service restarts (configurable interval)
+- Configurable interval: 1/3/6/12 hours, 1 day, or 7 days
+- Enable/disable toggle; manual reset now available from the same menu
 
 ### v1.8.0
 - **Multi-Tunnel Support** - Run multiple named tunnels on Server A, each connecting to a different Server B
@@ -57,6 +62,7 @@ Easy installer for tunneling VPN traffic through a middle server using [paqet](h
 - **Configuration Editor** - Change ports, keys, KCP settings, and MTU without manual file editing
 - **Connection Test Tool** - Built-in diagnostics to verify tunnel connectivity
 - **Auto-Updater** - Check for and install updates from within the script
+- **Automatic Reset** - Scheduled service restart for reliability (configurable interval)
 - **Smart Defaults** - Sensible defaults with easy customization
 
 ## Use Case

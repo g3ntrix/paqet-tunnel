@@ -11,12 +11,16 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.8.0"
+INSTALLER_VERSION="1.9.0"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
 PAQET_BIN="$PAQET_DIR/paqet"
 PAQET_SERVICE="paqet"
+AUTO_RESET_CONF="$PAQET_DIR/auto-reset.conf"
+AUTO_RESET_SCRIPT="$PAQET_DIR/auto-reset.sh"
+AUTO_RESET_SERVICE="paqet-auto-reset"
+AUTO_RESET_TIMER="paqet-auto-reset"
 GITHUB_REPO="hanselime/paqet"
 INSTALLER_REPO="g3ntrix/paqet-tunnel"
 INSTALLER_CMD="/usr/local/bin/paqet-tunnel"
@@ -1308,6 +1312,12 @@ uninstall() {
     systemctl disable paqet 2>/dev/null || true
     rm -f /etc/systemd/system/paqet.service
     
+    # Remove auto-reset timer
+    systemctl stop ${AUTO_RESET_TIMER}.timer 2>/dev/null || true
+    systemctl disable ${AUTO_RESET_TIMER}.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/${AUTO_RESET_TIMER}.timer
+    rm -f /etc/systemd/system/${AUTO_RESET_SERVICE}.service
+    
     systemctl daemon-reload
     print_success "All services removed"
     
@@ -2323,6 +2333,239 @@ tunnel_service_action() {
 }
 
 #===============================================================================
+# Automatic Reset (periodic service restart for reliability)
+#===============================================================================
+
+# Read auto-reset config. Returns: ENABLED, INTERVAL, UNIT
+read_auto_reset_config() {
+    if [ -f "$AUTO_RESET_CONF" ]; then
+        . "$AUTO_RESET_CONF"
+    fi
+    ENABLED="${ENABLED:-false}"
+    INTERVAL="${INTERVAL:-6}"
+    UNIT="${UNIT:-hour}"
+}
+
+# Write auto-reset config
+write_auto_reset_config() {
+    local enabled="$1"
+    local interval="$2"
+    local unit="$3"
+    mkdir -p "$PAQET_DIR"
+    cat > "$AUTO_RESET_CONF" << EOF
+# Auto-reset config - restarts paqet services periodically for reliability
+ENABLED="$enabled"
+INTERVAL="$interval"
+UNIT="$unit"
+EOF
+}
+
+# Create the reset script that restarts all paqet services
+create_auto_reset_script() {
+    cat > "$AUTO_RESET_SCRIPT" << 'RESET_SCRIPT'
+#!/bin/bash
+# Auto-reset: restart all paqet services periodically for reliability
+
+CONF="/opt/paqet/auto-reset.conf"
+[ -f "$CONF" ] && . "$CONF"
+
+[ "$ENABLED" != "true" ] && exit 0
+
+for svc in /etc/systemd/system/paqet*.service; do
+    [ -f "$svc" ] || continue
+    name=$(basename "$svc" .service)
+    [ "$name" = "paqet-auto-reset" ] && continue
+    systemctl restart "$name" 2>/dev/null || true
+done
+RESET_SCRIPT
+    chmod +x "$AUTO_RESET_SCRIPT"
+}
+
+# Create systemd service and timer for auto-reset
+create_auto_reset_timer() {
+    local interval="$1"
+    local unit="$2"
+    
+    # Convert to systemd time format
+    local period="${interval}${unit}"
+    
+    create_auto_reset_script
+    
+    cat > /etc/systemd/system/${AUTO_RESET_SERVICE}.service << EOF
+[Unit]
+Description=paqet Auto-Reset (periodic service restart for reliability)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$AUTO_RESET_SCRIPT
+EOF
+
+    cat > /etc/systemd/system/${AUTO_RESET_TIMER}.timer << EOF
+[Unit]
+Description=paqet Auto-Reset Timer
+Requires=${AUTO_RESET_SERVICE}.service
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${period}
+Persistent=yes
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now ${AUTO_RESET_TIMER}.timer 2>/dev/null || true
+    print_success "Auto-reset timer enabled (every $interval $unit(s))"
+}
+
+# Remove systemd timer and service
+remove_auto_reset_timer() {
+    systemctl stop ${AUTO_RESET_TIMER}.timer 2>/dev/null || true
+    systemctl disable ${AUTO_RESET_TIMER}.timer 2>/dev/null || true
+    rm -f "/etc/systemd/system/${AUTO_RESET_TIMER}.timer"
+    rm -f "/etc/systemd/system/${AUTO_RESET_SERVICE}.service"
+    systemctl daemon-reload
+    print_success "Auto-reset timer disabled"
+}
+
+# Manual reset: restart all paqet services
+manual_reset_all() {
+    echo ""
+    print_step "Restarting all paqet services..."
+    
+    local count=0
+    local configs=$(get_all_configs)
+    
+    if [ -z "$configs" ]; then
+        print_error "No tunnels configured"
+        return 1
+    fi
+    
+    while IFS= read -r config_file; do
+        local service=$(get_tunnel_service "$config_file")
+        local name=$(get_tunnel_name "$config_file")
+        if systemctl restart "$service" 2>/dev/null; then
+            print_success "Restarted: $name"
+            count=$((count + 1))
+        else
+            print_warning "Could not restart: $name"
+        fi
+    done <<< "$configs"
+    
+    if [ $count -gt 0 ]; then
+        print_success "Manual reset complete ($count service(s) restarted)"
+    fi
+    echo ""
+}
+
+# Auto-reset menu
+auto_reset_menu() {
+    while true; do
+        print_banner
+        echo -e "${YELLOW}Automatic Reset${NC}"
+        echo -e "${CYAN}Periodically restart paqet services for reliability${NC}"
+        echo ""
+        
+        read_auto_reset_config
+        
+        # Show current status
+        echo -e "${YELLOW}Current settings:${NC}"
+        if [ "$ENABLED" = "true" ]; then
+            echo -e "  Status:   ${GREEN}Enabled${NC}"
+            echo -e "  Interval: ${CYAN}Every $INTERVAL $UNIT(s)${NC}"
+            if systemctl is-active --quiet ${AUTO_RESET_TIMER}.timer 2>/dev/null; then
+                echo -e "  Timer:    ${GREEN}Active${NC}"
+            else
+                echo -e "  Timer:    ${RED}Inactive${NC}"
+            fi
+        else
+            echo -e "  Status:   ${RED}Disabled${NC}"
+        fi
+        echo ""
+        
+        echo -e "${YELLOW}Options:${NC}"
+        echo ""
+        echo -e "  ${CYAN}1)${NC} Enable automatic reset"
+        echo -e "  ${CYAN}2)${NC} Disable automatic reset"
+        echo -e "  ${CYAN}3)${NC} Set reset interval"
+        echo -e "  ${CYAN}4)${NC} Manual reset now (restart all tunnels)"
+        echo -e "  ${CYAN}0)${NC} Back to main menu"
+        echo ""
+        
+        read -p "Choice: " reset_choice < /dev/tty
+        
+        case $reset_choice in
+            1)
+                echo ""
+                if [ "$ENABLED" = "true" ]; then
+                    print_info "Automatic reset is already enabled"
+                else
+                    # Use existing interval or default
+                    read_auto_reset_config
+                    write_auto_reset_config "true" "${INTERVAL:-6}" "${UNIT:-hour}"
+                    create_auto_reset_timer "${INTERVAL:-6}" "${UNIT:-hour}"
+                fi
+                ;;
+            2)
+                echo ""
+                if [ "$ENABLED" != "true" ]; then
+                    print_info "Automatic reset is already disabled"
+                else
+                    write_auto_reset_config "false" "$INTERVAL" "$UNIT"
+                    remove_auto_reset_timer
+                fi
+                ;;
+            3)
+                echo ""
+                echo -e "${CYAN}Set reset interval${NC}"
+                echo ""
+                echo -e "  ${YELLOW}1)${NC} Every 1 hour"
+                echo -e "  ${YELLOW}2)${NC} Every 3 hours"
+                echo -e "  ${YELLOW}3)${NC} Every 6 hours"
+                echo -e "  ${YELLOW}4)${NC} Every 12 hours"
+                echo -e "  ${YELLOW}5)${NC} Every 24 hours (1 day)"
+                echo -e "  ${YELLOW}6)${NC} Every 7 days"
+                echo ""
+                read -p "Choice: " interval_choice < /dev/tty
+                
+                case $interval_choice in
+                    1) new_interval=1; new_unit=hour ;;
+                    2) new_interval=3; new_unit=hour ;;
+                    3) new_interval=6; new_unit=hour ;;
+                    4) new_interval=12; new_unit=hour ;;
+                    5) new_interval=1; new_unit=day ;;
+                    6) new_interval=7; new_unit=day ;;
+                    *) print_error "Invalid choice"; new_interval=""; new_unit="" ;;
+                esac
+                
+                if [ -n "$new_interval" ]; then
+                    write_auto_reset_config "$ENABLED" "$new_interval" "$new_unit"
+                    if [ "$ENABLED" = "true" ]; then
+                        create_auto_reset_timer "$new_interval" "$new_unit"
+                    fi
+                    print_success "Interval set to every $new_interval $new_unit(s)"
+                fi
+                ;;
+            4)
+                manual_reset_all
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                ;;
+        esac
+        
+        echo ""
+        echo -e "${YELLOW}Press Enter to continue...${NC}"
+        read < /dev/tty
+    done
+}
+
+#===============================================================================
 # Auto-Updater
 #===============================================================================
 
@@ -2557,6 +2800,7 @@ main() {
         echo -e "  ${GREEN}── Maintenance ──${NC}"
         echo -e "  ${CYAN}8)${NC} Check for Updates"
         echo -e "  ${CYAN}9)${NC} Show Port Defaults"
+        echo -e "  ${CYAN}a)${NC} Automatic Reset (scheduled restart)"
         echo -e "  ${CYAN}u)${NC} Uninstall paqet"
         echo ""
         echo -e "  ${GREEN}── Script ──${NC}"
@@ -2580,6 +2824,7 @@ main() {
             7) test_connection ;;
             8) check_for_updates ;;
             9) show_port_config ;;
+            [Aa]) auto_reset_menu ;;
             [Uu]) uninstall ;;
             [Ii]) install_command ;;
             [Rr]) uninstall_command ;;
