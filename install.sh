@@ -1892,22 +1892,30 @@ edit_kcp_settings() {
     echo -e "  ${YELLOW}Tip:${NC} If you get EOF errors, try MTU 1280 on BOTH ends of this tunnel."
     echo ""
     
-    local current_mtu=$(grep "mtu:" "$PAQET_CONFIG" | awk '{print $2}')
+    local current_mtu=$(grep "mtu:" "$PAQET_CONFIG" | grep -oE '[0-9]+' | head -1)
     [ -z "$current_mtu" ] && current_mtu="$DEFAULT_KCP_MTU"
-    read_required "Enter MTU (1280-1500)" KCP_MTU "$current_mtu"
     
-    # Validate MTU range
-    if [ "$KCP_MTU" -lt 1280 ] || [ "$KCP_MTU" -gt 1500 ]; then
-        print_warning "MTU should be between 1280 and 1500. Using $current_mtu"
-        KCP_MTU="$current_mtu"
-    fi
+    while true; do
+        read_required "Enter MTU value, between 1280 and 1500" KCP_MTU "$current_mtu"
+        if ! [[ "$KCP_MTU" =~ ^[0-9]+$ ]]; then
+            print_error "MTU must be a number (e.g., 1350)"
+            echo ""
+            continue
+        fi
+        if [ "$KCP_MTU" -lt 1280 ] || [ "$KCP_MTU" -gt 1500 ]; then
+            print_error "MTU must be between 1280 and 1500"
+            echo ""
+            continue
+        fi
+        break
+    done
     
     sed -i "s/mode: \"[^\"]*\"/mode: \"${KCP_MODE}\"/" "$PAQET_CONFIG"
     sed -i "s/conn: [0-9]*/conn: ${KCP_CONN}/" "$PAQET_CONFIG"
     
-    # Update or add MTU setting
+    # Update or add MTU setting (match entire value after "mtu: " to handle corrupted values)
     if grep -q "mtu:" "$PAQET_CONFIG"; then
-        sed -i "s/mtu: [0-9]*/mtu: ${KCP_MTU}/" "$PAQET_CONFIG"
+        sed -i "s/mtu: .*/mtu: ${KCP_MTU}/" "$PAQET_CONFIG"
     else
         # Add mtu after key line
         sed -i "/key:/a\\    mtu: ${KCP_MTU}" "$PAQET_CONFIG"
