@@ -11,7 +11,7 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.0"
+INSTALLER_VERSION="1.11.1"
 PAQET_VERSION="latest"
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
