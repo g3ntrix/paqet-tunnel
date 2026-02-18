@@ -3125,6 +3125,10 @@ check_for_updates() {
     
     # Compare versions (simple string comparison)
     if [ "$INSTALLER_VERSION" = "$latest_version" ]; then
+        echo ""
+        echo -e "${YELLOW}Check out my latest tunnel project (SMTP-based):${NC}"
+        echo -e "  ${CYAN}https://github.com/g3ntrix/smtp-tunnel${NC}"
+        echo ""
         print_success "You are running the latest version!"
         return 0
     fi
