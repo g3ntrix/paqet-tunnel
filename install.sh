@@ -3175,6 +3175,9 @@ update_installer() {
             fi
             
             echo ""
+            echo -e "${YELLOW}Check out my latest tunnel project (SMTP-based):${NC}"
+            echo -e "  ${CYAN}https://github.com/g3ntrix/smtp-tunnel${NC}"
+            echo ""
             print_step "Launching updated installer..."
             echo ""
             
