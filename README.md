@@ -2,149 +2,16 @@
 
 Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) - a raw packet-level tunneling tool that bypasses network restrictions.
 
-**Current Version:** v1.11.0
+**Current Version:** v1.11.2
 
-## Changelog
+## Start Here
 
-### v1.11.0
-- **IPTables Port Forwarding** - New menu option (**f**) under Maintenance: kernel-level NAT port forwarding (multi-port, all-ports with exclusions, view/remove/flush). Enables segregated port management and testing backup tunnels without service restarts.
-
-### v1.10.0
-- **Connection Protection & MTU Tuning** - New menu option (**d**) under Maintenance to apply iptables rules that:
-  - Bypass kernel connection tracking (raw table `NOTRACK`)
-  - Block fake RST packets injected by ISP or middleboxes (mangle `PREROUTING`/`OUTPUT`)
-  - Prevent the kernel from sending RST packets that interfere with paqet's raw socket tunnel
-- **Client-Side Protection** - Server A (Iran) now automatically installs connection protection iptables rules at setup time, targeting Server B's IP:port
-- **MTU Default Updated** - Default KCP MTU changed from `1350` to `1280` for better reliability on restrictive networks
-
-### v1.9.0
-- **Automatic Reset** - Option (a) for scheduled service restarts (configurable interval)
-- Configurable interval: 1/3/6/12 hours, 1 day, or 7 days
-- Enable/disable toggle; manual reset now available from the same menu
-
-### v1.8.0
-- **Multi-Tunnel Support** - Run multiple named tunnels on Server A, each connecting to a different Server B
-- Each tunnel gets its own config file (`config-<name>.yaml`) and systemd service (`paqet-<name>`)
-- New **Manage Tunnels** menu (option 6): add, remove, restart, stop, start individual tunnels
-- Status check now shows all tunnels at once
-- Edit/View/Test operations prompt for tunnel selection when multiple exist
-- Server B setup remains unchanged (single instance)
-
-### v1.7.0
-- **Port Settings** - Under Edit Configuration (option 5): add, remove, or replace V2Ray/paqet ports without full reconfiguration
-- View current port configuration and change paqet tunnel port on both server roles
-
-### v1.6.0
-- **Install as Command** - Option to install script as `paqet-tunnel` system command
-- Run `paqet-tunnel` anytime without needing curl
-- Update/remove command from menu
-
-### v1.5.1
-- **MTU Configuration** - Added MTU setting in KCP configuration
-- Helps fix EOF errors on restrictive networks (try 1280-1300)
-
-### v1.5.0
-- **Iran Network Optimization** - DNS finder and apt mirror selector for Iran servers
-- Improved version fetching with fallback to raw main branch
-
-### v1.4.0
-- **Enhanced Input Validation** - Won't exit on invalid input, keeps asking until valid
-- New default configurations for better out-of-box experience
-- Improved TCP connectivity test messaging for raw socket behavior
-
-### v1.3.0
-- Auto-check `/root/paqet` for local archives before downloading
-- Skip option for dependency installation
-- Manual install guide for restricted networks
-
-### v1.0.0
-- Initial release with Server A/B setup
-- Configuration editor for ports, keys, KCP settings
-- Connection test tool and auto-updater
-
-## Features
-
-- **Interactive Setup** - Guided installation for both Iran and abroad servers
-- **Multi-Tunnel Support** - Connect one Server A to multiple Server Bs with named tunnels
-- **Install as Command** - Run `paqet-tunnel` after installing
-- **Port Settings Menu** - Add, remove, or change V2Ray ports without reconfiguring
-- **Input Validation** - Won't exit on invalid input, keeps asking until valid
-- **Iran Network Optimization** - Optional DNS and apt mirror optimization for Iran servers
-- **Configuration Editor** - Change ports, keys, KCP settings, and MTU without manual file editing
-- **Connection Test Tool** - Built-in diagnostics to verify tunnel connectivity
-- **Auto-Updater** - Check for and install updates from within the script
-- **Automatic Reset** - Scheduled service restart for reliability (configurable interval)
-- **Smart Defaults** - Sensible defaults with easy customization
-- **Connection Protection** - iptables rules and tools to resist fake RST injection and connection drops
-
-## Use Case
-
-This tool is designed for users in **Iran** (or other restricted regions) who need to access VPN servers located **abroad**. Instead of connecting directly to your VPN server (which may be blocked or throttled), traffic is routed through a middle server using raw packet tunneling that evades detection.
-
-## Overview
-
-paqet uses raw TCP packet injection to create a tunnel that:
-
-- Bypasses kernel-level connection tracking (conntrack)
-- Uses KCP protocol for encrypted, reliable transport
-- Is much harder to detect than SSH or VPN protocols
-- Evades Deep Packet Inspection (DPI)
-
-## Architecture
-
-### Single Server B
-
-```
-┌─────────────┐                              ┌─────────────┐
-│  Clients    │                              │   Server B  │
-│  (V2Ray)    │                              │  (ABROAD)   │
-└──────┬──────┘                              │  VPN Server │
-       │                                     │  e.g. USA   │
-       │ Connect to                          └──────┬──────┘
-       │ Server A IP                                │
-       ▼                                            │ V2Ray/X-UI
-┌──────────────┐      paqet tunnel           ┌──────▼──────┐
-│   Server A   │◄───────────────────────────►│   paqet     │
-│   (IRAN)     │     (KCP encrypted)         │   server    │
-│ Entry Point  │                             │  port 8888  │
-└──────────────┘                             └─────────────┘
-```
-
-### Multiple Server Bs
-
-Server A can run multiple named tunnels, each connecting to a different Server B:
-
-```
-                                             ┌──────────────┐
-                          paqet-usa          │  Server B1   │
-                     ┌──────────────────────►│  (USA)       │
-                     │   ports 443,8443      │  port 8888   │
-┌─────────────┐      │                       └──────────────┘
-│  Clients    │      │                       ┌──────────────┐
-│  (V2Ray)    │──►┌──┴───────────┐  germany  │  Server B2   │
-└─────────────┘   │   Server A   ├──────────►│  (Germany)   │
-                  │   (IRAN)     │  port 2053 │  port 8888   │
-                  └──┬───────────┘           └──────────────┘
-                     │                       ┌──────────────┐
-                     │  paqet-france         │  Server B3   │
-                     └──────────────────────►│  (France)    │
-                         port 2096           │  port 8888   │
-                                             └──────────────┘
-```
-
-Each tunnel has its own config (`/opt/paqet/config-<name>.yaml`) and service (`paqet-<name>`).
-
-**Servers:**
-
-- **Server A (Iran)**: Entry point server located in Iran - clients connect here
-- **Server B (Abroad)**: Your VPN server abroad (USA, Germany, etc.) running V2Ray/X-UI
-
-**Traffic Flow:**
-
-1. Client connects to Server A (Iran) on the V2Ray port
-2. Server A tunnels traffic through paqet to Server B (Abroad)
-3. Server B forwards to local V2Ray (`127.0.0.1:PORT`)
-4. Response flows back through the tunnel
+- [Quick Start](#quick-start)
+- [Installation Steps](#installation-steps)
+- [Menu Options](#menu-options)
+- [Commands](#commands)
+- [Troubleshooting](#troubleshooting)
+- [Reference and Changelog](#reference-and-changelog)
 
 ## Quick Start
 
@@ -261,7 +128,7 @@ apt install -y libpcap0.8 iptables curl
 dpkg -l | grep -E "libpcap|iptables|curl"
 ```
 
-When running the installer, choose **'s'** to skip dependency installation when prompted.
+When running the installer, choose **'s'** to skip dependency installation when prompted. The dependency prompt only appears if required packages are missing.
 
 ## Performance Optimization
 
@@ -361,8 +228,10 @@ The menu also shows a quick status: whether IP forwarding is enabled and how man
 Add, remove, and control individual tunnels on Server A:
 
 - **Add new tunnel** - Runs Server A setup with a new tunnel name
-- **Remove a tunnel** - Stops service and removes config for a selected tunnel
+- **Remove tunnel(s)** - Remove one selected tunnel or remove all tunnels at once
 - **Restart/Stop/Start** - Control individual tunnel services
+
+Tunnel numbers are shown separately from action keys so selecting a tunnel is no longer confused with menu actions.
 
 ### Edit Configuration (Option 5)
 
@@ -440,6 +309,154 @@ cat /opt/paqet/config.yaml
 # Uninstall
 # Run installer again and select option 'u'
 ```
+
+## Reference and Changelog
+
+### Features
+
+- **Interactive Setup** - Guided installation for both Iran and abroad servers
+- **Multi-Tunnel Support** - Connect one Server A to multiple Server Bs with named tunnels
+- **Install as Command** - Run `paqet-tunnel` after installing
+- **Port Settings Menu** - Add, remove, or change V2Ray ports without reconfiguring
+- **Input Validation** - Won't exit on invalid input, keeps asking until valid
+- **Iran Network Optimization** - Optional DNS and apt mirror optimization for Iran servers
+- **Configuration Editor** - Change ports, keys, KCP settings, and MTU without manual file editing
+- **Connection Test Tool** - Built-in diagnostics to verify tunnel connectivity
+- **Auto-Updater** - Check for and install updates from within the script
+- **Automatic Reset** - Scheduled service restart for reliability (configurable interval)
+- **Smart Defaults** - Sensible defaults with easy customization
+- **Connection Protection** - iptables rules and tools to resist fake RST injection and connection drops
+
+### Use Case
+
+This tool is designed for users in **Iran** (or other restricted regions) who need to access VPN servers located **abroad**. Instead of connecting directly to your VPN server (which may be blocked or throttled), traffic is routed through a middle server using raw packet tunneling that evades detection.
+
+### Overview
+
+paqet uses raw TCP packet injection to create a tunnel that:
+
+- Bypasses kernel-level connection tracking (conntrack)
+- Uses KCP protocol for encrypted, reliable transport
+- Is much harder to detect than SSH or VPN protocols
+- Evades Deep Packet Inspection (DPI)
+
+### Architecture
+
+#### Single Server B
+
+```
+┌─────────────┐                              ┌─────────────┐
+│  Clients    │                              │   Server B  │
+│  (V2Ray)    │                              │  (ABROAD)   │
+└──────┬──────┘                              │  VPN Server │
+       │                                     │  e.g. USA   │
+       │ Connect to                          └──────┬──────┘
+       │ Server A IP                                │
+       ▼                                            │ V2Ray/X-UI
+┌──────────────┐      paqet tunnel           ┌──────▼──────┐
+│   Server A   │◄───────────────────────────►│   paqet     │
+│   (IRAN)     │     (KCP encrypted)         │   server    │
+│ Entry Point  │                             │  port 8888  │
+└──────────────┘                             └─────────────┘
+```
+
+#### Multiple Server Bs
+
+Server A can run multiple named tunnels, each connecting to a different Server B:
+
+```
+                                             ┌──────────────┐
+                          paqet-usa          │  Server B1   │
+                     ┌──────────────────────►│  (USA)       │
+                     │   ports 443,8443      │  port 8888   │
+┌─────────────┐      │                       └──────────────┘
+│  Clients    │      │                       ┌──────────────┐
+│  (V2Ray)    │──►┌──┴───────────┐  germany  │  Server B2   │
+└─────────────┘   │   Server A   ├──────────►│  (Germany)   │
+                  │   (IRAN)     │ port 2053 │  port 8888   │
+                  └──┬───────────┘           └──────────────┘
+                     │                       ┌──────────────┐
+                     │  paqet-france         │  Server B3   │
+                     └──────────────────────►│  (France)    │
+                         port 2096           │  port 8888   │
+                                             └──────────────┘
+```
+
+Each tunnel has its own config (`/opt/paqet/config-<name>.yaml`) and service (`paqet-<name>`).
+
+**Servers:**
+
+- **Server A (Iran)**: Entry point server located in Iran - clients connect here
+- **Server B (Abroad)**: Your VPN server abroad (USA, Germany, etc.) running V2Ray/X-UI
+
+**Traffic Flow:**
+
+1. Client connects to Server A (Iran) on the V2Ray port
+2. Server A tunnels traffic through paqet to Server B (Abroad)
+3. Server B forwards to local V2Ray (`127.0.0.1:PORT`)
+4. Response flows back through the tunnel
+
+### Changelog
+
+#### v1.11.2
+- **Tunnel Management UX** - Option 6 now separates tunnel numbers from action keys to avoid ambiguous selections, and tunnel removal now supports removing all tunnels.
+- **Smarter Setup Prompts** - Iran optimization remains Iran-only, dependency prompts only appear when packages are actually missing, and setup now verifies the created service is running before showing the success banner.
+
+#### v1.11.0
+- **IPTables Port Forwarding** - New menu option (**f**) under Maintenance: kernel-level NAT port forwarding (multi-port, all-ports with exclusions, view/remove/flush). Enables segregated port management and testing backup tunnels without service restarts.
+
+#### v1.10.0
+- **Connection Protection & MTU Tuning** - New menu option (**d**) under Maintenance to apply iptables rules that:
+  - Bypass kernel connection tracking (raw table `NOTRACK`)
+  - Block fake RST packets injected by ISP or middleboxes (mangle `PREROUTING`/`OUTPUT`)
+  - Prevent the kernel from sending RST packets that interfere with paqet's raw socket tunnel
+- **Client-Side Protection** - Server A (Iran) now automatically installs connection protection iptables rules at setup time, targeting Server B's IP:port
+- **MTU Default Updated** - Default KCP MTU changed from `1350` to `1280` for better reliability on restrictive networks
+
+#### v1.9.0
+- **Automatic Reset** - Option (a) for scheduled service restarts (configurable interval)
+- Configurable interval: 1/3/6/12 hours, 1 day, or 7 days
+- Enable/disable toggle; manual reset now available from the same menu
+
+#### v1.8.0
+- **Multi-Tunnel Support** - Run multiple named tunnels on Server A, each connecting to a different Server B
+- Each tunnel gets its own config file (`config-<name>.yaml`) and systemd service (`paqet-<name>`)
+- New **Manage Tunnels** menu (option 6): add, remove, restart, stop, start individual tunnels
+- Status check now shows all tunnels at once
+- Edit/View/Test operations prompt for tunnel selection when multiple exist
+- Server B setup remains unchanged (single instance)
+
+#### v1.7.0
+- **Port Settings** - Under Edit Configuration (option 5): add, remove, or replace V2Ray/paqet ports without full reconfiguration
+- View current port configuration and change paqet tunnel port on both server roles
+
+#### v1.6.0
+- **Install as Command** - Option to install script as `paqet-tunnel` system command
+- Run `paqet-tunnel` anytime without needing curl
+- Update/remove command from menu
+
+#### v1.5.1
+- **MTU Configuration** - Added MTU setting in KCP configuration
+- Helps fix EOF errors on restrictive networks (try 1280-1300)
+
+#### v1.5.0
+- **Iran Network Optimization** - DNS finder and apt mirror selector for Iran servers
+- Improved version fetching with fallback to raw main branch
+
+#### v1.4.0
+- **Enhanced Input Validation** - Won't exit on invalid input, keeps asking until valid
+- New default configurations for better out-of-box experience
+- Improved TCP connectivity test messaging for raw socket behavior
+
+#### v1.3.0
+- Auto-check `/root/paqet` for local archives before downloading
+- Skip option for dependency installation
+- Manual install guide for restricted networks
+
+#### v1.0.0
+- Initial release with Server A/B setup
+- Configuration editor for ports, keys, KCP settings
+- Connection test tool and auto-updater
 
 ## Requirements
 

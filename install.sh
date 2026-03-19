@@ -11,8 +11,9 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="1.11.1"
+INSTALLER_VERSION="1.11.2"
 PAQET_VERSION="latest"
+OFFLINE_MODE=false
 PAQET_DIR="/opt/paqet"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
 PAQET_BIN="$PAQET_DIR/paqet"
@@ -446,7 +447,7 @@ get_tunnel_count() {
 
 # List all tunnels with status
 list_tunnels() {
-    local configs=$(get_all_configs)
+    local configs=$(get_tunnel_configs)
     
     if [ -z "$configs" ]; then
         print_info "No tunnels configured"
@@ -485,7 +486,7 @@ list_tunnels() {
 # Returns 0 on success, 1 if no tunnels or user cancelled
 select_tunnel() {
     local prompt="${1:-Select tunnel}"
-    local configs=$(get_all_configs)
+    local configs=$(get_tunnel_configs)
     local count=0
     if [ -n "$configs" ]; then
         count=$(echo "$configs" | wc -l)
@@ -513,7 +514,7 @@ select_tunnel() {
     list_tunnels
     echo ""
     
-    read -p "Choice: " tunnel_choice < /dev/tty
+    read -p "Tunnel number: " tunnel_choice < /dev/tty
     
     # Validate choice
     if ! [[ "$tunnel_choice" =~ ^[0-9]+$ ]] || [ "$tunnel_choice" -lt 1 ] || [ "$tunnel_choice" -gt "$count" ]; then
@@ -694,25 +695,103 @@ run_iran_optimizations() {
     fi
 }
 
+format_list_csv() {
+    local first=true
+    local item=""
+
+    for item in "$@"; do
+        [ -z "$item" ] && continue
+        if [ "$first" = true ]; then
+            printf "%s" "$item"
+            first=false
+        else
+            printf ", %s" "$item"
+        fi
+    done
+}
+
+get_dependency_packages() {
+    local os=$(detect_os)
+
+    case $os in
+        ubuntu|debian)
+            printf '%s\n' curl wget libpcap-dev iptables lsof
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            printf '%s\n' curl wget libpcap-devel iptables lsof
+            ;;
+        *)
+            printf '%s\n' curl libpcap iptables
+            ;;
+    esac
+}
+
+is_dependency_installed() {
+    local package_name="$1"
+    local os="${2:-$(detect_os)}"
+
+    case "$package_name" in
+        curl|wget|lsof|iptables)
+            command -v "$package_name" >/dev/null 2>&1 && return 0
+            ;;
+    esac
+
+    case $os in
+        ubuntu|debian)
+            dpkg -s "$package_name" >/dev/null 2>&1
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            rpm -q "$package_name" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_missing_dependencies() {
+    local os=$(detect_os)
+    local package_name=""
+
+    while IFS= read -r package_name; do
+        [ -z "$package_name" ] && continue
+        if ! is_dependency_installed "$package_name" "$os"; then
+            echo "$package_name"
+        fi
+    done < <(get_dependency_packages)
+}
+
 install_dependencies() {
-    print_step "Installing dependencies..."
-    
-    echo -e "${YELLOW}Install dependencies? (y/n/s to skip)${NC}"
-    echo -e "${CYAN}Required: libpcap-dev, iptables, curl${NC}"
-    read -t 10 -p "> " install_deps < /dev/tty || install_deps="y"
-    
-    if [[ "$install_deps" =~ ^[Ss]$ ]]; then
-        print_warning "Skipping dependency installation"
-        print_info "Make sure these are installed: libpcap-dev iptables curl"
+    local os=$(detect_os)
+    local missing_packages=()
+    local package_name=""
+    local install_deps=""
+
+    while IFS= read -r package_name; do
+        [ -n "$package_name" ] && missing_packages+=("$package_name")
+    done < <(get_missing_dependencies)
+
+    if [ ${#missing_packages[@]} -eq 0 ]; then
+        print_success "Dependencies already installed"
         return 0
     fi
-    
+
+    print_step "Installing dependencies..."
+    echo -e "${YELLOW}Install dependencies? (y/n/s to skip)${NC}"
+    echo -e "${CYAN}Required: $(format_list_csv "${missing_packages[@]}")${NC}"
+    read -t 10 -p "> " install_deps < /dev/tty || install_deps="y"
+
+    if [[ "$install_deps" =~ ^[Ss]$ ]]; then
+        print_warning "Skipping dependency installation"
+        print_info "Still missing: $(format_list_csv "${missing_packages[@]}")"
+        return 0
+    fi
+
     if [[ ! "$install_deps" =~ ^[Yy]$ ]] && [ -n "$install_deps" ]; then
         print_warning "Skipping dependency installation"
         return 0
     fi
-    
-    local os=$(detect_os)
+
     case $os in
         ubuntu|debian)
             print_info "Running apt update (may take time)..."
@@ -722,18 +801,18 @@ install_dependencies() {
             }
             
             print_info "Installing packages..."
-            apt install -y -qq curl wget libpcap-dev iptables lsof > /dev/null 2>&1 || {
+            apt install -y -qq "${missing_packages[@]}" > /dev/null 2>&1 || {
                 print_warning "Some packages may have failed to install"
                 print_info "Continuing anyway..."
             }
             ;;
         centos|rhel|fedora|rocky|almalinux)
-            yum install -y -q curl wget libpcap-devel iptables lsof > /dev/null 2>&1 || {
+            yum install -y -q "${missing_packages[@]}" > /dev/null 2>&1 || {
                 print_warning "Some packages may have failed to install"
             }
             ;;
         *)
-            print_warning "Unknown OS. Please install libpcap manually."
+            print_warning "Unknown OS. Please install these manually: $(format_list_csv "${missing_packages[@]}")"
             ;;
     esac
     
@@ -741,7 +820,11 @@ install_dependencies() {
 }
 
 download_paqet() {
-    print_step "Downloading paqet binary..."
+    if [ "$OFFLINE_MODE" = true ]; then
+        print_step "Loading paqet binary (offline mode)..."
+    else
+        print_step "Downloading paqet binary..."
+    fi
     
     local arch=$(detect_arch)
     local os="linux"
@@ -750,8 +833,16 @@ download_paqet() {
     
     # Get the latest version tag
     local version=""
-    if [ "$PAQET_VERSION" = "latest" ]; then
-        version=$(curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ "$OFFLINE_MODE" = true ]; then
+        # In offline mode, use fallback version or PAQET_VERSION env var
+        if [ "$PAQET_VERSION" = "latest" ]; then
+            version="v1.0.0-alpha.11"
+            print_info "Offline mode: using fallback version $version"
+        else
+            version="$PAQET_VERSION"
+        fi
+    elif [ "$PAQET_VERSION" = "latest" ]; then
+        version=$(curl -s --max-time 10 https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$version" ]; then
             print_warning "Failed to get latest version from GitHub"
             version="v1.0.0-alpha.11"  # Fallback version
@@ -764,8 +855,10 @@ download_paqet() {
     local archive_name="paqet-${os}-${arch}-${version}.tar.gz"
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${archive_name}"
     
-    print_info "Downloading version: $version"
-    print_info "URL: $download_url"
+    print_info "Version: $version"
+    if [ "$OFFLINE_MODE" != true ]; then
+        print_info "URL: $download_url"
+    fi
     
     # Check for local file in /root/paqet first
     local local_dir="/root/paqet"
@@ -811,15 +904,24 @@ download_paqet() {
         fi
     fi
     
-    # Try downloading if no local file was used
+    # Try downloading if no local file was used (skip in offline mode)
     if [ "$download_success" = false ]; then
-        print_info "Attempting download..."
-        if timeout 30 curl -fsSL "$download_url" -o "$temp_archive" 2>/dev/null; then
-            download_success=true
-            print_success "Download completed"
+        if [ "$OFFLINE_MODE" = true ]; then
+            # Offline mode: skip download, go directly to local file prompt
+            print_warning "Offline mode: no local file found"
         else
-            print_error "Failed to download paqet binary"
-            print_warning "Download blocked or network issue detected"
+            print_info "Attempting download..."
+            if timeout 30 curl -fsSL "$download_url" -o "$temp_archive" 2>/dev/null; then
+                download_success=true
+                print_success "Download completed"
+            else
+                print_error "Failed to download paqet binary"
+                print_warning "Download blocked or network issue detected"
+            fi
+        fi
+        
+        # Ask for local file if download failed or in offline mode
+        if [ "$download_success" = false ]; then
             echo ""
             echo -e "${YELLOW}Do you have a local copy of the paqet archive? (y/n)${NC}"
             read -p "> " has_local < /dev/tty
@@ -1189,6 +1291,28 @@ EOF
     print_success "Systemd service created"
 }
 
+start_and_verify_service() {
+    local service_name="$1"
+    local display_name="${2:-$1}"
+
+    print_step "Starting service ${service_name}..."
+
+    if ! systemctl enable --now "$service_name" >/dev/null 2>&1; then
+        print_error "Failed to start ${display_name}"
+        systemctl status "$service_name" --no-pager -l || true
+        return 1
+    fi
+
+    sleep 1
+    if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        print_error "${display_name} is not active"
+        systemctl status "$service_name" --no-pager -l || true
+        return 1
+    fi
+
+    print_success "${display_name} is running"
+}
+
 #===============================================================================
 # Server B Setup (Abroad - VPN Server with paqet server)
 #===============================================================================
@@ -1293,7 +1417,7 @@ EOF
     create_systemd_service
     
     # Start service
-    systemctl enable --now $PAQET_SERVICE
+    start_and_verify_service "$PAQET_SERVICE" "Server B service" || return 1
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
@@ -1463,7 +1587,7 @@ EOF
     create_systemd_service
     
     # Start service
-    systemctl enable --now $PAQET_SERVICE
+    start_and_verify_service "$PAQET_SERVICE" "Tunnel '${TUNNEL_NAME}'" || return 1
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
@@ -2542,7 +2666,7 @@ manage_tunnels_menu() {
         echo ""
         
         # Show all tunnels
-        local configs=$(get_all_configs)
+        local configs=$(get_tunnel_configs)
         if [ -n "$configs" ]; then
             echo -e "${YELLOW}Current Tunnels:${NC}"
             echo ""
@@ -2554,22 +2678,22 @@ manage_tunnels_menu() {
         echo ""
         echo -e "${YELLOW}Options:${NC}"
         echo ""
-        echo -e "  ${CYAN}1)${NC} Add new tunnel (setup Server A)"
-        echo -e "  ${CYAN}2)${NC} Remove a tunnel"
-        echo -e "  ${CYAN}3)${NC} Restart a tunnel"
-        echo -e "  ${CYAN}4)${NC} Stop a tunnel"
-        echo -e "  ${CYAN}5)${NC} Start a tunnel"
+        echo -e "  ${CYAN}a)${NC} Add new tunnel (setup Server A)"
+        echo -e "  ${CYAN}x)${NC} Remove tunnel(s)"
+        echo -e "  ${CYAN}r)${NC} Restart a tunnel"
+        echo -e "  ${CYAN}s)${NC} Stop a tunnel"
+        echo -e "  ${CYAN}t)${NC} Start a tunnel"
         echo -e "  ${CYAN}0)${NC} Back to main menu"
         echo ""
         
-        read -p "Choice: " manage_choice < /dev/tty
+        read -p "Action: " manage_choice < /dev/tty
         
         case $manage_choice in
-            1) run_iran_optimizations; install_dependencies; setup_server_a ;;
-            2) remove_tunnel ;;
-            3) tunnel_service_action "restart" ;;
-            4) tunnel_service_action "stop" ;;
-            5) tunnel_service_action "start" ;;
+            [Aa]) run_iran_optimizations; install_dependencies; setup_server_a ;;
+            [Xx]) remove_tunnel ;;
+            [Rr]) tunnel_service_action "restart" ;;
+            [Ss]) tunnel_service_action "stop" ;;
+            [Tt]) tunnel_service_action "start" ;;
             0) return 0 ;;
             *) print_error "Invalid choice" ;;
         esac
@@ -2580,64 +2704,112 @@ manage_tunnels_menu() {
     done
 }
 
+# Remove one tunnel config and its service
+remove_single_tunnel_config() {
+    local config_file="$1"
+    local name=$(get_tunnel_name "$config_file")
+    local service=$(get_tunnel_service "$config_file")
+    local role=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"')
+
+    if [ "$role" = "client" ]; then
+        local server_addr=$(grep -A1 "^server:" "$config_file" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
+        local s_ip=$(echo "$server_addr" | cut -d':' -f1)
+        local s_port=$(echo "$server_addr" | cut -d':' -f2)
+        if [ -n "$s_ip" ] && [ -n "$s_port" ]; then
+            remove_iptables_client "$s_ip" "$s_port"
+            save_iptables
+        fi
+    fi
+
+    print_step "Stopping service $service..."
+    systemctl stop "$service" 2>/dev/null || true
+    systemctl disable "$service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${service}.service"
+    systemctl daemon-reload
+    print_success "Service removed for tunnel '$name'"
+
+    rm -f "$config_file"
+    print_success "Configuration removed for tunnel '$name'"
+}
+
+prompt_remove_paqet_files_if_unused() {
+    local remaining=$(get_all_configs)
+
+    if [ -z "$remaining" ]; then
+        echo ""
+        read_confirm "No tunnels remaining. Remove paqet binary too?" remove_bin "n"
+        if [ "$remove_bin" = true ]; then
+            rm -rf "$PAQET_DIR"
+            print_success "All paqet files removed"
+        fi
+    fi
+}
+
 # Remove a specific tunnel
 remove_tunnel() {
     echo ""
     
-    local configs=$(get_all_configs)
+    local configs=$(get_tunnel_configs)
     if [ -z "$configs" ]; then
         print_error "No tunnels to remove"
         return 1
     fi
-    
-    select_tunnel "Select tunnel to remove" || return 1
-    
+
+    echo -e "${YELLOW}Remove options:${NC}"
+    echo -e "  ${CYAN}1)${NC} Remove one tunnel"
+    echo -e "  ${CYAN}2)${NC} Remove all tunnels"
+    echo -e "  ${CYAN}0)${NC} Cancel"
+    echo ""
+    read -p "Choice: " remove_choice < /dev/tty
+
+    case "$remove_choice" in
+        0)
+            print_info "Cancelled"
+            return 0
+            ;;
+        1)
+            select_tunnel "Select tunnel to remove" || return 1
+            ;;
+        2)
+            echo ""
+            print_warning "This will remove ALL tunnels on this server."
+            read_confirm "Are you sure?" confirm_remove_all "n"
+
+            if [ "$confirm_remove_all" != true ]; then
+                print_info "Cancelled"
+                return 0
+            fi
+
+            while IFS= read -r config_file; do
+                [ -n "$config_file" ] && remove_single_tunnel_config "$config_file"
+            done <<< "$configs"
+
+            prompt_remove_paqet_files_if_unused
+            PAQET_CONFIG="$PAQET_DIR/config.yaml"
+            PAQET_SERVICE="paqet"
+            echo ""
+            print_success "All tunnels removed"
+            return 0
+            ;;
+        *)
+            print_error "Invalid choice"
+            return 1
+            ;;
+    esac
+
     local name=$(get_tunnel_name "$PAQET_CONFIG")
-    local service="$PAQET_SERVICE"
     
     echo ""
     print_warning "This will remove tunnel '$name':"
     echo -e "  Config:  ${CYAN}$PAQET_CONFIG${NC}"
-    echo -e "  Service: ${CYAN}$service${NC}"
+    echo -e "  Service: ${CYAN}$PAQET_SERVICE${NC}"
     echo ""
     
     read_confirm "Are you sure?" confirm_remove "n"
     
     if [ "$confirm_remove" = true ]; then
-        # Remove iptables rules for this tunnel
-        local role=$(grep "^role:" "$PAQET_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"')
-        if [ "$role" = "client" ]; then
-            local server_addr=$(grep -A1 "^server:" "$PAQET_CONFIG" 2>/dev/null | grep "addr:" | awk '{print $2}' | tr -d '"')
-            local s_ip=$(echo "$server_addr" | cut -d':' -f1)
-            local s_port=$(echo "$server_addr" | cut -d':' -f2)
-            if [ -n "$s_ip" ] && [ -n "$s_port" ]; then
-                remove_iptables_client "$s_ip" "$s_port"
-                save_iptables
-            fi
-        fi
-        
-        # Stop and disable service
-        print_step "Stopping service $service..."
-        systemctl stop "$service" 2>/dev/null || true
-        systemctl disable "$service" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${service}.service"
-        systemctl daemon-reload
-        print_success "Service removed"
-        
-        # Remove config
-        rm -f "$PAQET_CONFIG"
-        print_success "Configuration removed"
-        
-        # Check if any tunnels remain
-        local remaining=$(get_all_configs)
-        if [ -z "$remaining" ]; then
-            echo ""
-            read_confirm "No tunnels remaining. Remove paqet binary too?" remove_bin "n"
-            if [ "$remove_bin" = true ]; then
-                rm -rf "$PAQET_DIR"
-                print_success "All paqet files removed"
-            fi
-        fi
+        remove_single_tunnel_config "$PAQET_CONFIG"
+        prompt_remove_paqet_files_if_unused
         
         echo ""
         print_success "Tunnel '$name' removed"
@@ -3297,8 +3469,21 @@ is_command_installed() {
 #===============================================================================
 
 main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --offline)
+                OFFLINE_MODE=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
     check_root
-    
+
     # Auto-sync: if paqet-tunnel command exists but is outdated, update it silently
     if is_command_installed; then
         local installed_ver=$(grep '^INSTALLER_VERSION=' "$INSTALLER_CMD" 2>/dev/null | cut -d'"' -f2)
