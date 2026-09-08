@@ -11,13 +11,20 @@
 set -e
 
 # Configuration
-INSTALLER_VERSION="2.0.0"
-PAQET_VERSION="latest"
+INSTALLER_VERSION="2.2.0"
+# paqet's raw binary protocol is version-locked: client and server MUST run the
+# exact same paqet version or the tunnel silently fails. We therefore pin a
+# known-good version by default instead of tracking "latest", and propagate the
+# server's version to the client through the connection string.
+PAQET_PINNED_VERSION="v1.0.0-alpha.20"  # known-good; used as default and offline/fallback
+PAQET_VERSION="$PAQET_PINNED_VERSION"    # override with env PAQET_VERSION=latest or a tag
+PAQET_TARGET_VERSION=""                  # when set, download_paqet installs exactly this tag
 OFFLINE_MODE=false
-PAQET_DIR="/opt/paqet"
+PAQET_DIR="${PAQET_DIR:-/opt/paqet}"
 PAQET_CONFIG="$PAQET_DIR/config.yaml"
 PAQET_BIN="$PAQET_DIR/paqet"
 PAQET_SERVICE="paqet"
+PAQET_FIREWALL_SCRIPT=""
 AUTO_RESET_CONF="$PAQET_DIR/auto-reset.conf"
 AUTO_RESET_SCRIPT="$PAQET_DIR/auto-reset.sh"
 AUTO_RESET_SERVICE="paqet-auto-reset"
@@ -25,6 +32,12 @@ AUTO_RESET_TIMER="paqet-auto-reset"
 GITHUB_REPO="hanselime/paqet"
 INSTALLER_REPO="g3ntrix/paqet-tunnel"
 INSTALLER_CMD="/usr/local/bin/paqet-tunnel"
+RELAY_DIR="/etc/paqet-relay"
+RELAY_SERVICE="paqet-relay"
+RELAY_UNIT="/etc/systemd/system/${RELAY_SERVICE}.service"
+RELAY_STATE="${RELAY_DIR}/relay.conf"
+RELAY_KEY="/root/.ssh/paqet-relay-ed25519"
+RELAY_KNOWN_HOSTS="/root/.ssh/known_hosts_paqet_relay"
 DONATE_TON="UQCriHkMUa6h9oN059tyC23T13OsQhGGM3hUS2S4IYRBZgvx"
 DONATE_USDT_BEP20="0x71F41696c60C4693305e67eE3Baa650a4E3dA796"
 
@@ -667,6 +680,16 @@ detect_arch() {
     esac
 }
 
+# Report the paqet version currently installed on this host (empty if unknown).
+# Prefers the marker file written at download time; falls back to the binary.
+get_installed_paqet_version() {
+    if [ -s "$PAQET_DIR/.paqet-version" ]; then
+        head -1 "$PAQET_DIR/.paqet-version" | tr -d '[:space:]'
+    elif [ -x "$PAQET_BIN" ]; then
+        "$PAQET_BIN" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | head -1
+    fi
+}
+
 get_public_ip() {
     local ip=""
     ip=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null) || \
@@ -766,10 +789,13 @@ detect_and_confirm_network() {
 }
 
 # Encode a connection string the Abroad server hands to the Iran server (V2).
-# Args: public_ip paqet_port secret_key forward_ports
+# Args: public_ip paqet_port secret_key forward_ports [paqet_version]
 # Output: paqet://<url-safe-base64>
 encode_connection_string() {
     local payload="ip=$1;port=$2;key=$3;fwd=$4"
+    # Carry the paqet version so Server A installs the exact same (protocol-locked)
+    # binary as Server B. Older strings without it still decode fine.
+    [ -n "$5" ] && payload="${payload};ver=$5"
     local b64
     b64=$(printf '%s' "$payload" | base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '=')
     echo "paqet://${b64}"
@@ -799,6 +825,7 @@ decode_connection_string() {
     CS_PORT=$(printf '%s' "$payload" | grep -oE 'port=[^;]+' | cut -d= -f2)
     CS_KEY=$(printf '%s' "$payload" | grep -oE 'key=[^;]+' | cut -d= -f2)
     CS_FWD=$(printf '%s' "$payload" | grep -oE 'fwd=[^;]+' | cut -d= -f2)
+    CS_VER=$(printf '%s' "$payload" | grep -oE 'ver=[^;]+' | cut -d= -f2)  # optional
 
     [ -n "$CS_IP" ] && [ -n "$CS_PORT" ] && [ -n "$CS_KEY" ] || return 1
     return 0
@@ -1026,23 +1053,26 @@ download_paqet() {
     
     mkdir -p "$PAQET_DIR"
     
-    # Get the latest version tag
+    # Resolve which paqet version to install.
     local version=""
-    if [ "$OFFLINE_MODE" = true ]; then
-        # In offline mode, use fallback version or PAQET_VERSION env var
-        if [ "$PAQET_VERSION" = "latest" ]; then
-            version="v1.0.0-alpha.11"
-            print_info "Offline mode: using fallback version $version"
-        else
-            version="$PAQET_VERSION"
-        fi
+    if [ -n "$PAQET_TARGET_VERSION" ]; then
+        # An exact version was requested (e.g. matched to Server B via the
+        # connection string). This wins over everything to keep both ends locked.
+        version="$PAQET_TARGET_VERSION"
+        print_info "Installing pinned version to match the other server: $version"
     elif [ "$PAQET_VERSION" = "latest" ]; then
-        version=$(curl -s --max-time 10 https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [ -z "$version" ]; then
-            print_warning "Failed to get latest version from GitHub"
-            version="v1.0.0-alpha.11"  # Fallback version
+        if [ "$OFFLINE_MODE" = true ]; then
+            version="$PAQET_PINNED_VERSION"
+            print_info "Offline mode: using pinned version $version"
+        else
+            version=$(curl -s --max-time 10 https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ -z "$version" ]; then
+                print_warning "Failed to get latest version from GitHub"
+                version="$PAQET_PINNED_VERSION"  # Fallback to pinned known-good
+            fi
         fi
     else
+        # Explicit pin (default is $PAQET_PINNED_VERSION).
         version="$PAQET_VERSION"
     fi
     
@@ -1124,7 +1154,7 @@ download_paqet() {
             if [[ "$has_local" =~ ^[Yy]$ ]]; then
                 while true; do
                     echo -e "${YELLOW}Enter the full path to the paqet tar.gz file. Press Enter to cancel:${NC}"
-                    echo -e "${CYAN}Example: /root/paqet/paqet-linux-amd64-v1.0.0-alpha.11.tar.gz${NC}"
+                    echo -e "${CYAN}Example: /root/paqet/paqet-linux-amd64-${PAQET_PINNED_VERSION}.tar.gz${NC}"
                     read -p "> " local_archive < /dev/tty
                     [ -z "$local_archive" ] && break
                     if [ -f "$local_archive" ]; then
@@ -1162,7 +1192,10 @@ download_paqet() {
             rm -f "$temp_archive"
             # Clean up example files
             rm -rf "$PAQET_DIR/README.md" "$PAQET_DIR/example" 2>/dev/null || true
-            print_success "paqet binary installed successfully"
+            # Record the installed version so the connection string can lock the
+            # other server to the same (protocol-incompatible) release.
+            printf '%s\n' "$version" > "$PAQET_DIR/.paqet-version" 2>/dev/null || true
+            print_success "paqet binary installed successfully ($version)"
         else
             print_error "Binary not found in archive"
             print_info "Expected: $extracted_binary"
@@ -1190,18 +1223,18 @@ setup_iptables() {
     print_step "Configuring iptables for port $port..."
     
     # Remove existing rules if any
-    iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
-    iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
-    iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    while iptables -t raw -D PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t raw -D OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
     
     # Add new rules
-    iptables -t raw -A PREROUTING -p tcp --dport $port -j NOTRACK
-    iptables -t raw -A OUTPUT -p tcp --sport $port -j NOTRACK
+    iptables -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
+    iptables -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
     # Block outgoing RST from kernel (prevents kernel interference with raw sockets)
-    iptables -t mangle -A OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP
+    iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
     # Block incoming fake RST packets (some ISPs inject spoofed RSTs to kill tunnels)
-    iptables -t mangle -A PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
     
     save_iptables
     print_success "iptables configured"
@@ -1215,10 +1248,10 @@ setup_iptables_client() {
     print_step "Configuring iptables for tunnel to $server_ip:$server_port..."
     
     # Remove existing rules if any
-    iptables -t raw -D OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK 2>/dev/null || true
-    iptables -t raw -D PREROUTING -p tcp -s $server_ip --sport $server_port -j NOTRACK 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -d $server_ip --dport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
-    iptables -t mangle -D PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    while iptables -t raw -D OUTPUT -p tcp -d "$server_ip" --dport "$server_port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t raw -D PREROUTING -p tcp -s "$server_ip" --sport "$server_port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t mangle -D OUTPUT -p tcp -d "$server_ip" --dport "$server_port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -p tcp -s "$server_ip" --sport "$server_port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
     
     # Bypass kernel connection tracking for tunnel traffic
     iptables -t raw -A OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK
@@ -1236,18 +1269,56 @@ setup_iptables_client() {
 remove_iptables_client() {
     local server_ip=$1
     local server_port=$2
-    iptables -t raw -D OUTPUT -p tcp -d $server_ip --dport $server_port -j NOTRACK 2>/dev/null || true
-    iptables -t raw -D PREROUTING -p tcp -s $server_ip --sport $server_port -j NOTRACK 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -d $server_ip --dport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
-    iptables -t mangle -D PREROUTING -p tcp -s $server_ip --sport $server_port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    while iptables -t raw -D OUTPUT -p tcp -d "$server_ip" --dport "$server_port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t raw -D PREROUTING -p tcp -s "$server_ip" --sport "$server_port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t mangle -D OUTPUT -p tcp -d "$server_ip" --dport "$server_port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -p tcp -s "$server_ip" --sport "$server_port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
 }
 
 remove_iptables_server() {
     local port=$1
-    iptables -t raw -D PREROUTING -p tcp --dport $port -j NOTRACK 2>/dev/null || true
-    iptables -t raw -D OUTPUT -p tcp --sport $port -j NOTRACK 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp --sport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
-    iptables -t mangle -D PREROUTING -p tcp --dport $port --tcp-flags RST RST -j DROP 2>/dev/null || true
+    while iptables -t raw -D PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t raw -D OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null; do :; done
+    while iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+}
+
+# Create a per-service firewall hook. This makes raw-socket protection survive a
+# reboot even when iptables-persistent/firewalld is not installed on the host.
+create_firewall_restore_script() {
+    local role="$1"
+    local server_ip="$2"
+    local port="$3"
+    PAQET_FIREWALL_SCRIPT="$PAQET_DIR/firewall-${PAQET_SERVICE}.sh"
+
+    if [ "$role" = "server" ]; then
+        cat > "$PAQET_FIREWALL_SCRIPT" << EOF
+#!/bin/sh
+set -e
+while iptables -t raw -D PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null; do :; done
+while iptables -t raw -D OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null; do :; done
+while iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+while iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+iptables -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
+iptables -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
+iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+EOF
+    else
+        cat > "$PAQET_FIREWALL_SCRIPT" << EOF
+#!/bin/sh
+set -e
+while iptables -t raw -D OUTPUT -p tcp -d "$server_ip" --dport "$port" -j NOTRACK 2>/dev/null; do :; done
+while iptables -t raw -D PREROUTING -p tcp -s "$server_ip" --sport "$port" -j NOTRACK 2>/dev/null; do :; done
+while iptables -t mangle -D OUTPUT -p tcp -d "$server_ip" --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+while iptables -t mangle -D PREROUTING -p tcp -s "$server_ip" --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null; do :; done
+iptables -t raw -A OUTPUT -p tcp -d "$server_ip" --dport "$port" -j NOTRACK
+iptables -t raw -A PREROUTING -p tcp -s "$server_ip" --sport "$port" -j NOTRACK
+iptables -t mangle -A OUTPUT -p tcp -d "$server_ip" --dport "$port" --tcp-flags RST RST -j DROP
+iptables -t mangle -A PREROUTING -p tcp -s "$server_ip" --sport "$port" --tcp-flags RST RST -j DROP
+EOF
+    fi
+    chmod 0755 "$PAQET_FIREWALL_SCRIPT"
 }
 
 # Save iptables rules to persistent storage
@@ -1472,15 +1543,21 @@ flush_nat_rules() {
 
 create_systemd_service() {
     print_step "Creating systemd service..."
-    
+    local firewall_pre=""
+    if [ -n "$PAQET_FIREWALL_SCRIPT" ] && [ -x "$PAQET_FIREWALL_SCRIPT" ]; then
+        firewall_pre="ExecStartPre=${PAQET_FIREWALL_SCRIPT}"
+    fi
+
     cat > /etc/systemd/system/${PAQET_SERVICE}.service << EOF
 [Unit]
 Description=paqet Raw Packet Tunnel
-After=network.target
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+${firewall_pre}
 ExecStart=${PAQET_BIN} run -c ${PAQET_CONFIG}
 Restart=always
 RestartSec=5
@@ -1578,13 +1655,14 @@ health_check_config() {
         server_port=$(grep -A2 '^server:' "$config" 2>/dev/null | grep 'addr:' | grep -oE ':[0-9]+' | tr -d ':' | head -1)
         fwd_ports=$(grep -oE 'listen:[[:space:]]*"[^"]*"' "$config" 2>/dev/null | grep -oE ':[0-9]+"' | tr -d ':"' | tr '\n' ' ')
 
-        # 2) Listening on local forward port(s)
+        # 2) Listening on local forward / SOCKS5 port(s). Accept a bind on
+        #    0.0.0.0 (forward + public SOCKS5) or 127.0.0.1 (local-only SOCKS5).
         local lp
         for lp in $fwd_ports; do
-            if ss -tln 2>/dev/null | grep -qE "(\*|0\.0\.0\.0):${lp}\b"; then
-                print_success "paqet is accepting connections on 0.0.0.0:${lp}"
+            if ss -tln 2>/dev/null | grep -qE "(\*|0\.0\.0\.0|127\.0\.0\.1):${lp}\b"; then
+                print_success "paqet is accepting connections on port ${lp}"
             else
-                print_error "Not listening on 0.0.0.0:${lp}"
+                print_error "Not listening on port ${lp}"
                 fails=$((fails + 1))
             fi
         done
@@ -1655,12 +1733,15 @@ show_connection_string() {
         return 0
     fi
 
+    local paqet_ver
+    paqet_ver=$(get_installed_paqet_version)
     local conn_string
-    conn_string=$(encode_connection_string "$pub" "$port" "$key" "$ports")
+    conn_string=$(encode_connection_string "$pub" "$port" "$key" "$ports" "$paqet_ver")
 
     echo -e "  ${YELLOW}Public IP:${NC}   ${CYAN}$pub${NC}"
     echo -e "  ${YELLOW}paqet Port:${NC}  ${CYAN}$port${NC}"
     echo -e "  ${YELLOW}V2Ray Ports:${NC} ${CYAN}$ports${NC}"
+    echo -e "  ${YELLOW}paqet Version:${NC} ${CYAN}${paqet_ver:-unknown}${NC}"
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${YELLOW}  Copy this to Server A (Iran):${NC}"
@@ -1698,6 +1779,39 @@ setup_server_b() {
     print_banner
     echo -e "${GREEN}Setting up Server B (Abroad - VPN Server)${NC}"
     echo -e "${CYAN}This server runs your V2Ray/X-UI and the paqet server${NC}"
+    echo ""
+
+    local server_name=""
+    echo -e "${CYAN}Optional: give this Server B instance a name so it gets its own config/service.${NC}"
+    echo -e "${CYAN}Leave blank for the legacy single-instance layout (${PAQET_DIR}/config.yaml, service paqet).${NC}"
+    read_optional "Server B instance name" server_name
+
+    if [ -n "$server_name" ]; then
+        local name_regex='^[a-z0-9][a-z0-9-]*$'
+        while true; do
+            if [[ "$server_name" =~ $name_regex ]] && [ ${#server_name} -le 32 ]; then
+                PAQET_CONFIG="$PAQET_DIR/config-${server_name}.yaml"
+                PAQET_SERVICE="paqet-${server_name}"
+                break
+            fi
+
+            print_error "Invalid instance name. Use lowercase letters, numbers, and hyphens only (max 32 characters)."
+            read_optional "Server B instance name" server_name
+            if [ -z "$server_name" ]; then
+                PAQET_CONFIG="$PAQET_DIR/config.yaml"
+                PAQET_SERVICE="paqet"
+                break
+            fi
+        done
+    else
+        PAQET_CONFIG="$PAQET_DIR/config.yaml"
+        PAQET_SERVICE="paqet"
+    fi
+
+    echo ""
+    print_info "Server B will use:"
+    echo -e "  Config:  ${CYAN}$PAQET_CONFIG${NC}"
+    echo -e "  Service: ${CYAN}$PAQET_SERVICE${NC}"
     echo ""
     
     # Detect + confirm network configuration in one step (V2)
@@ -1742,11 +1856,13 @@ setup_server_b() {
     echo -e "${CYAN}Generated secret key: $secret_key${NC}"
     read_required "Secret key (press Enter to use generated)" secret_key "$secret_key"
     
-    # Download paqet
+    # Download paqet (Server B defines the version both ends will use)
+    PAQET_TARGET_VERSION=""   # B follows PAQET_VERSION (pinned by default, or "latest")
     download_paqet || return 0
-    
+
     # Setup iptables
     setup_iptables "$PAQET_PORT"
+    create_firewall_restore_script "server" "" "$PAQET_PORT"
     
     # Create config file
     print_step "Creating configuration..."
@@ -1791,9 +1907,12 @@ EOF
     # Start service
     start_and_verify_service "$PAQET_SERVICE" "Server B service" || return 1
     
-    # Build the one-paste connection string for Server A (V2)
+    # Build the one-paste connection string for Server A (V2).
+    # Include the installed paqet version so Server A locks to the same binary.
+    local paqet_ver
+    paqet_ver=$(get_installed_paqet_version)
     local conn_string
-    conn_string=$(encode_connection_string "$public_ip" "$PAQET_PORT" "$secret_key" "$INBOUND_PORTS")
+    conn_string=$(encode_connection_string "$public_ip" "$PAQET_PORT" "$secret_key" "$INBOUND_PORTS" "$paqet_ver")
 
     # Post-setup health check
     echo ""
@@ -1807,6 +1926,7 @@ EOF
     echo -e "  ${YELLOW}Public IP:${NC}     ${CYAN}$public_ip${NC}"
     echo -e "  ${YELLOW}paqet Port:${NC}    ${CYAN}$PAQET_PORT${NC}"
     echo -e "  ${YELLOW}V2Ray Ports:${NC}   ${CYAN}$INBOUND_PORTS${NC}"
+    echo -e "  ${YELLOW}paqet Version:${NC} ${CYAN}${paqet_ver:-unknown}${NC} ${YELLOW}(Server A will match this)${NC}"
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${YELLOW}  CONNECTION STRING — copy this to Server A (Iran):${NC}"
@@ -1863,6 +1983,8 @@ setup_server_a() {
     SERVER_B_IP=""
     SERVER_B_PORT=""
     SECRET_KEY=""
+    CS_VER=""                     # paqet version advertised by Server B (if any)
+    PAQET_TARGET_VERSION=""       # reset any lock left over from a previous menu action
     local prefill_ports=""
     echo -e "${CYAN}Paste the Connection String from Server B (starts with 'paqet://').${NC}"
     echo -e "${CYAN}Or press Enter to type the details manually.${NC}"
@@ -1880,10 +2002,11 @@ setup_server_a() {
             echo -e "  paqet Port:    ${CYAN}$SERVER_B_PORT${NC}"
             echo -e "  Forward Ports: ${CYAN}$prefill_ports${NC}"
             echo -e "  Secret Key:    ${CYAN}${SECRET_KEY:0:6}…${NC} (hidden)"
+            [ -n "$CS_VER" ] && echo -e "  paqet Version: ${CYAN}$CS_VER${NC} ${YELLOW}(this server will install the same)${NC}"
             echo ""
             local cs_ok=true
             read_confirm "Use these details?" cs_ok "y"
-            [ "$cs_ok" != true ] && { SERVER_B_IP=""; SERVER_B_PORT=""; SECRET_KEY=""; prefill_ports=""; }
+            [ "$cs_ok" != true ] && { SERVER_B_IP=""; SERVER_B_PORT=""; SECRET_KEY=""; prefill_ports=""; CS_VER=""; }
         else
             print_error "Could not decode that connection string — falling back to manual entry."
         fi
@@ -1911,52 +2034,104 @@ setup_server_a() {
     local public_ip="$NET_PUBLIC_IP"
     local gateway_mac="$NET_GATEWAY_MAC"
 
-    # Ports to forward (with validation) — default to the ports from the connection string
+    # ── Tunnel mode: port forwarding (V2Ray) or built-in SOCKS5 proxy (new in alpha.20) ──
     echo ""
-    echo -e "${CYAN}These will be accessible on this server and forwarded to Server B${NC}"
-    read_ports "Enter ports to forward (comma-separated)" FORWARD_PORTS "${prefill_ports:-$DEFAULT_FORWARD_PORTS}"
+    echo -e "${YELLOW}How should this tunnel expose traffic?${NC}"
+    echo -e "  ${CYAN}1)${NC} Port forwarding  — forward specific ports to Server B (V2Ray/X-UI) ${GREEN}[recommended]${NC}"
+    echo -e "  ${CYAN}2)${NC} SOCKS5 proxy     — run a general-purpose proxy that exits via Server B"
+    echo ""
+    local mode_choice="1"
+    read_optional "Choose mode" mode_choice "1"
+    local TUNNEL_MODE="forward"
+    [ "$mode_choice" = "2" ] && TUNNEL_MODE="socks5"
 
-    # Guard: B's paqet tunnel port must differ from the forwarded (V2Ray) ports.
-    # On Server B, paqet listens on the tunnel port and forwards to V2Ray on a
-    # different port, so these can never legitimately collide. If they do, the
-    # user almost certainly entered their V2Ray port as the paqet port.
-    while echo ",${FORWARD_PORTS}," | tr -d ' ' | grep -q ",${SERVER_B_PORT},"; do
+    local FORWARD_PORTS=""
+    local SOCKS_HOST="" SOCKS_PORT="" SOCKS_USER="" SOCKS_PASS=""
+    local PORTS=()
+
+    if [ "$TUNNEL_MODE" = "forward" ]; then
+        # Ports to forward (with validation) — default to the ports from the connection string
         echo ""
-        print_error "Server B paqet port (${SERVER_B_PORT}) is also in your forward ports (${FORWARD_PORTS})."
-        print_info "The paqet port is the TUNNEL port from Server B (default ${DEFAULT_PAQET_PORT}), not a V2Ray port."
-        print_info "Dialing the V2Ray port instead of the tunnel port is the #1 cause of 'connection lost'."
-        read_port "Re-enter Server B paqet tunnel port" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
-    done
+        echo -e "${CYAN}These will be accessible on this server and forwarded to Server B${NC}"
+        read_ports "Enter ports to forward (comma-separated)" FORWARD_PORTS "${prefill_ports:-$DEFAULT_FORWARD_PORTS}"
 
-    # Check port conflicts
-    echo ""
-    IFS=',' read -ra PORTS <<< "$FORWARD_PORTS"
-    for port in "${PORTS[@]}"; do
-        port=$(echo "$port" | tr -d ' ')
-        check_port_conflict "$port" || return 0
-    done
-    
-    # Download paqet (only if binary doesn't exist yet)
-    if [ ! -f "$PAQET_BIN" ]; then
-        download_paqet || return 0
+        # Guard: B's paqet tunnel port must differ from the forwarded (V2Ray) ports.
+        # On Server B, paqet listens on the tunnel port and forwards to V2Ray on a
+        # different port, so these can never legitimately collide. If they do, the
+        # user almost certainly entered their V2Ray port as the paqet port.
+        while echo ",${FORWARD_PORTS}," | tr -d ' ' | grep -q ",${SERVER_B_PORT},"; do
+            echo ""
+            print_error "Server B paqet port (${SERVER_B_PORT}) is also in your forward ports (${FORWARD_PORTS})."
+            print_info "The paqet port is the TUNNEL port from Server B (default ${DEFAULT_PAQET_PORT}), not a V2Ray port."
+            print_info "Dialing the V2Ray port instead of the tunnel port is the #1 cause of 'connection lost'."
+            read_port "Re-enter Server B paqet tunnel port" SERVER_B_PORT "$DEFAULT_PAQET_PORT"
+        done
+
+        # Check port conflicts
+        echo ""
+        IFS=',' read -ra PORTS <<< "$FORWARD_PORTS"
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | tr -d ' ')
+            check_port_conflict "$port" || return 0
+        done
     else
-        print_success "paqet binary already installed"
+        # SOCKS5 proxy mode — paqet's built-in SOCKS5 server tunnels everything to Server B
+        echo ""
+        echo -e "${CYAN}The SOCKS5 proxy listens on this server and tunnels all traffic through Server B.${NC}"
+        echo -e "${CYAN}Point your SOCKS5 client (browser, phone, router) at this server's IP.${NC}"
+        echo ""
+        read_optional "Listen host (0.0.0.0 = reachable by clients, 127.0.0.1 = local only)" SOCKS_HOST "0.0.0.0"
+        read_port "SOCKS5 listen port" SOCKS_PORT "1080"
+        while [ "$SOCKS_PORT" = "$SERVER_B_PORT" ]; do
+            print_error "SOCKS5 port ($SOCKS_PORT) must differ from the paqet tunnel port ($SERVER_B_PORT)."
+            read_port "SOCKS5 listen port" SOCKS_PORT "1080"
+        done
+        echo ""
+        echo -e "${CYAN}Optional authentication (leave blank for an open proxy).${NC}"
+        read_optional "SOCKS5 username" SOCKS_USER
+        [ -n "$SOCKS_USER" ] && read_optional "SOCKS5 password" SOCKS_PASS
+        echo ""
+        check_port_conflict "$SOCKS_PORT" || return 0
     fi
-    
-    # Create forward configuration
+
+    # Download / version-lock paqet. The raw protocol is version-locked, and Server A
+    # shares ONE binary across all tunnels, so every Server B it dials must match it.
+    local installed_ver
+    installed_ver=$(get_installed_paqet_version)
+    if [ ! -f "$PAQET_BIN" ]; then
+        [ -n "$CS_VER" ] && PAQET_TARGET_VERSION="$CS_VER"
+        download_paqet || return 0
+    elif [ -n "$CS_VER" ] && [ -n "$installed_ver" ] && [ "$installed_ver" != "$CS_VER" ]; then
+        echo ""
+        print_warning "Installed paqet is ${installed_ver}, but this Server B runs ${CS_VER}."
+        print_info "paqet's protocol is version-locked and all tunnels here share one binary,"
+        print_info "so every Server B must run the same paqet version."
+        local do_switch=false
+        read_confirm "Re-install paqet ${CS_VER} now? (also affects existing tunnels)" do_switch "n"
+        if [ "$do_switch" = true ]; then
+            PAQET_TARGET_VERSION="$CS_VER"
+            download_paqet || return 0
+            print_warning "Restart your other tunnels so they use the new binary (option 6 → restart)."
+        fi
+    else
+        print_success "paqet binary already installed (${installed_ver:-unknown})"
+    fi
+
+    # Create configuration
     print_step "Creating configuration..."
-    
-    # Build forward section
-    local forward_config=""
-    for port in "${PORTS[@]}"; do
-        port=$(echo "$port" | tr -d ' ')
-        forward_config="${forward_config}
+
+    if [ "$TUNNEL_MODE" = "forward" ]; then
+        # Build forward section
+        local forward_config=""
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | tr -d ' ')
+            forward_config="${forward_config}
   - listen: \"0.0.0.0:${port}\"
     target: \"127.0.0.1:${port}\"
     protocol: \"tcp\""
-    done
-    
-    cat > "$PAQET_CONFIG" << EOF
+        done
+
+        cat > "$PAQET_CONFIG" << EOF
 # paqet Client Configuration (Port Forwarding Mode)
 # Tunnel: ${TUNNEL_NAME}
 # Generated by installer on $(date)
@@ -1990,11 +2165,51 @@ transport:
     key: "${SECRET_KEY}"
     mtu: ${DEFAULT_KCP_MTU}
 EOF
-    
+    else
+        cat > "$PAQET_CONFIG" << EOF
+# paqet Client Configuration (SOCKS5 Proxy Mode)
+# Tunnel: ${TUNNEL_NAME}
+# Generated by installer on $(date)
+role: "client"
+
+log:
+  level: "info"
+
+# Built-in SOCKS5 proxy — all traffic exits through Server B
+socks5:
+  - listen: "${SOCKS_HOST}:${SOCKS_PORT}"
+    username: "${SOCKS_USER}"
+    password: "${SOCKS_PASS}"
+
+network:
+  interface: "${interface}"
+  ipv4:
+    addr: "${local_ip}:0"
+    router_mac: "${gateway_mac}"
+  tcp:
+    local_flag: ["PA"]
+    remote_flag: ["PA"]
+  pcap:
+    sockbuf: 4194304
+
+server:
+  addr: "${SERVER_B_IP}:${SERVER_B_PORT}"
+
+transport:
+  protocol: "kcp"
+  conn: ${DEFAULT_KCP_CONN}
+  kcp:
+    mode: "${DEFAULT_KCP_MODE}"
+    key: "${SECRET_KEY}"
+    mtu: ${DEFAULT_KCP_MTU}
+EOF
+    fi
+
     print_success "Configuration created: $PAQET_CONFIG"
     
     # Setup iptables protection rules for tunnel to Server B
     setup_iptables_client "$SERVER_B_IP" "$SERVER_B_PORT"
+    create_firewall_restore_script "client" "$SERVER_B_IP" "$SERVER_B_PORT"
     
     # Create systemd service
     create_systemd_service
@@ -2015,18 +2230,34 @@ EOF
     echo -e "  ${YELLOW}Tunnel Name:${NC}   ${CYAN}$TUNNEL_NAME${NC}"
     echo -e "  ${YELLOW}This Server:${NC}   ${CYAN}$public_ip${NC}"
     echo -e "  ${YELLOW}Server B:${NC}      ${CYAN}$SERVER_B_IP:$SERVER_B_PORT${NC}"
-    echo -e "  ${YELLOW}Forwarding:${NC}    ${CYAN}$FORWARD_PORTS${NC}"
-    echo ""
-    echo -e "${YELLOW}Client Connection:${NC}"
-    echo -e "  Clients should connect to: ${CYAN}$public_ip${NC}"
-    echo -e "  On ports: ${CYAN}$FORWARD_PORTS${NC}"
-    echo ""
-    echo -e "${YELLOW}Example V2Ray config update:${NC}"
-    for port in "${PORTS[@]}"; do
-        port=$(echo "$port" | tr -d ' ')
-        echo -e "  Change: ${RED}vless://...@${SERVER_B_IP}:${port}${NC}"
-        echo -e "  To:     ${GREEN}vless://...@${public_ip}:${port}${NC}"
-    done
+    echo -e "  ${YELLOW}paqet Version:${NC} ${CYAN}$(get_installed_paqet_version)${NC}"
+    if [ "$TUNNEL_MODE" = "socks5" ]; then
+        echo -e "  ${YELLOW}Mode:${NC}          ${CYAN}SOCKS5 proxy${NC}"
+        echo -e "  ${YELLOW}Proxy:${NC}         ${CYAN}${SOCKS_HOST}:${SOCKS_PORT}${NC}$([ -n "$SOCKS_USER" ] && echo " ${YELLOW}(auth enabled)${NC}")"
+        echo ""
+        echo -e "${YELLOW}Client Connection:${NC}"
+        echo -e "  Set your SOCKS5 proxy to: ${CYAN}${public_ip}:${SOCKS_PORT}${NC}"
+        [ -n "$SOCKS_USER" ] && echo -e "  Username: ${CYAN}${SOCKS_USER}${NC}   Password: ${CYAN}${SOCKS_PASS}${NC}"
+        if [ "$SOCKS_HOST" != "0.0.0.0" ]; then
+            print_warning "Listen host is ${SOCKS_HOST} — the proxy is only reachable locally on this server."
+        else
+            print_info "Open port ${SOCKS_PORT}/tcp in this server's cloud firewall so clients can reach it."
+        fi
+    else
+        echo -e "  ${YELLOW}Mode:${NC}          ${CYAN}Port forwarding${NC}"
+        echo -e "  ${YELLOW}Forwarding:${NC}    ${CYAN}$FORWARD_PORTS${NC}"
+        echo ""
+        echo -e "${YELLOW}Client Connection:${NC}"
+        echo -e "  Clients should connect to: ${CYAN}$public_ip${NC}"
+        echo -e "  On ports: ${CYAN}$FORWARD_PORTS${NC}"
+        echo ""
+        echo -e "${YELLOW}Example V2Ray config update:${NC}"
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | tr -d ' ')
+            echo -e "  Change: ${RED}vless://...@${SERVER_B_IP}:${port}${NC}"
+            echo -e "  To:     ${GREEN}vless://...@${public_ip}:${port}${NC}"
+        done
+    fi
     echo ""
     echo -e "${YELLOW}Commands:${NC}"
     echo -e "  Status:  ${CYAN}systemctl status $PAQET_SERVICE${NC}"
@@ -3447,7 +3678,8 @@ create_auto_reset_script() {
 #!/bin/bash
 # Auto-reset: restart all paqet services periodically for reliability
 
-CONF="/opt/paqet/auto-reset.conf"
+PAQET_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONF="$PAQET_DIR/auto-reset.conf"
 [ -f "$CONF" ] && . "$CONF"
 
 [ "$ENABLED" != "true" ] && exit 0
@@ -3947,9 +4179,14 @@ show_port_config() {
     echo -e "  ${YELLOW}KCP mode:${NC}               ${CYAN}$DEFAULT_KCP_MODE${NC}"
     echo -e "  ${YELLOW}KCP connections:${NC}        ${CYAN}$DEFAULT_KCP_CONN${NC}"
     echo -e "  ${YELLOW}KCP MTU:${NC}                ${CYAN}$DEFAULT_KCP_MTU${NC}"
+    echo -e "  ${YELLOW}paqet version (target):${NC} ${CYAN}$PAQET_VERSION${NC}"
+    echo -e "  ${YELLOW}paqet version (here):${NC}   ${CYAN}$(get_installed_paqet_version 2>/dev/null || echo 'not installed')${NC}"
     echo -e "${MAGENTA}════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "${CYAN}To change defaults, edit the script header configuration section.${NC}"
+    echo -e "${CYAN}paqet's protocol is version-locked: both servers must run the same version.${NC}"
+    echo -e "${CYAN}The connection string carries the version, so Server A auto-matches Server B.${NC}"
+    echo -e "${CYAN}Override with: ${NC}${YELLOW}PAQET_VERSION=latest bash install.sh${NC}"
+    echo -e "${CYAN}To change other defaults, edit the script header configuration section.${NC}"
     echo ""
 }
 
@@ -4025,6 +4262,419 @@ is_command_installed() {
     [ -f "$INSTALLER_CMD" ]
 }
 
+#===============================================================================
+# Reliable SSH Relay
+#
+# This mode is a TCP fallback for networks where paqet's raw packets are
+# filtered. Clients connect to Server A on the same VLESS port; an encrypted,
+# forwarding-only SSH session carries that TCP stream to Server B's localhost.
+#===============================================================================
+
+relay_b64_encode() {
+    base64 2>/dev/null | tr -d '\n' | tr '+/' '-_' | tr -d '='
+}
+
+relay_read_required() {
+    local prompt="$1" varname="$2" default_value="${3:-}" value=""
+    while true; do
+        if [ -n "$default_value" ]; then
+            echo -e "${YELLOW}${prompt} [${default_value}]:${NC}"
+        else
+            echo -e "${YELLOW}${prompt}:${NC}"
+        fi
+        read -r -p "> " value < /dev/tty
+        [ -z "$value" ] && value="$default_value"
+        if [ -n "$value" ]; then
+            printf -v "$varname" '%s' "$value"
+            return 0
+        fi
+        print_error "This field is required."
+    done
+}
+
+relay_b64_decode() {
+    local value="$1"
+    local padding=$(( (4 - ${#value} % 4) % 4 ))
+    value=$(printf '%s' "$value" | tr -- '-_' '+/')
+    while [ "$padding" -gt 0 ]; do
+        value="${value}="
+        padding=$((padding - 1))
+    done
+    printf '%s' "$value" | base64 -d 2>/dev/null
+}
+
+relay_valid_ipv4() {
+    local ip="$1" octet
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a relay_octets <<< "$ip"
+    for octet in "${relay_octets[@]}"; do
+        [ "$octet" -le 255 ] || return 1
+    done
+}
+
+relay_valid_user() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]
+}
+
+relay_known_host_label() {
+    if [ "$2" = "22" ]; then
+        printf '%s' "$1"
+    else
+        printf '[%s]:%s' "$1" "$2"
+    fi
+}
+
+relay_encode_server_code() {
+    local host="$1" ssh_port="$2" ssh_user="$3" target_port="$4" host_key="$5"
+    local host_key_b64 payload
+    host_key_b64=$(printf '%s' "$host_key" | base64 | tr -d '\n')
+    payload="v=1;host=${host};ssh_port=${ssh_port};ssh_user=${ssh_user};target_port=${target_port};host_key=${host_key_b64}"
+    printf 'relay://%s\n' "$(printf '%s' "$payload" | relay_b64_encode)"
+}
+
+relay_decode_server_code() {
+    local code="$1" payload item key value
+    code="${code#relay://}"
+    payload=$(relay_b64_decode "$code") || return 1
+
+    RELAY_CODE_HOST=""; RELAY_CODE_SSH_PORT=""; RELAY_CODE_SSH_USER=""
+    RELAY_CODE_TARGET_PORT=""; RELAY_CODE_HOST_KEY=""
+    IFS=';' read -r -a relay_items <<< "$payload"
+    for item in "${relay_items[@]}"; do
+        key="${item%%=*}"; value="${item#*=}"
+        case "$key" in
+            host) RELAY_CODE_HOST="$value" ;;
+            ssh_port) RELAY_CODE_SSH_PORT="$value" ;;
+            ssh_user) RELAY_CODE_SSH_USER="$value" ;;
+            target_port) RELAY_CODE_TARGET_PORT="$value" ;;
+            host_key) RELAY_CODE_HOST_KEY=$(printf '%s' "$value" | base64 -d 2>/dev/null) ;;
+        esac
+    done
+    relay_valid_ipv4 "$RELAY_CODE_HOST" || return 1
+    [[ "$RELAY_CODE_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$RELAY_CODE_SSH_PORT" -ge 1 ] && [ "$RELAY_CODE_SSH_PORT" -le 65535 ] || return 1
+    relay_valid_user "$RELAY_CODE_SSH_USER" || return 1
+    [[ "$RELAY_CODE_TARGET_PORT" =~ ^[0-9]+$ ]] && [ "$RELAY_CODE_TARGET_PORT" -ge 1 ] && [ "$RELAY_CODE_TARGET_PORT" -le 65535 ] || return 1
+    [[ "$RELAY_CODE_HOST_KEY" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]] || return 1
+}
+
+relay_encode_key_code() {
+    local public_key="$1" target_port="$2" tag="$3"
+    local public_key_b64 payload
+    public_key_b64=$(printf '%s' "$public_key" | base64 | tr -d '\n')
+    payload="v=1;public_key=${public_key_b64};target_port=${target_port};tag=${tag}"
+    printf 'relay-key://%s\n' "$(printf '%s' "$payload" | relay_b64_encode)"
+}
+
+relay_decode_key_code() {
+    local code="$1" payload item key value
+    code="${code#relay-key://}"
+    payload=$(relay_b64_decode "$code") || return 1
+    RELAY_CODE_PUBLIC_KEY=""; RELAY_CODE_TARGET_PORT=""; RELAY_CODE_TAG=""
+    IFS=';' read -r -a relay_items <<< "$payload"
+    for item in "${relay_items[@]}"; do
+        key="${item%%=*}"; value="${item#*=}"
+        case "$key" in
+            public_key) RELAY_CODE_PUBLIC_KEY=$(printf '%s' "$value" | base64 -d 2>/dev/null) ;;
+            target_port) RELAY_CODE_TARGET_PORT="$value" ;;
+            tag) RELAY_CODE_TAG="$value" ;;
+        esac
+    done
+    [[ "$RELAY_CODE_PUBLIC_KEY" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+([[:space:]].*)?$ ]] || return 1
+    [[ "$RELAY_CODE_TARGET_PORT" =~ ^[0-9]+$ ]] && [ "$RELAY_CODE_TARGET_PORT" -ge 1 ] && [ "$RELAY_CODE_TARGET_PORT" -le 65535 ] || return 1
+    [[ "$RELAY_CODE_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+}
+
+relay_write_state() {
+    install -d -m 700 "$RELAY_DIR"
+    {
+        printf 'ABROAD_IP=%q\n' "$ABROAD_IP"
+        printf 'ABROAD_SSH_PORT=%q\n' "$ABROAD_SSH_PORT"
+        printf 'ABROAD_SSH_USER=%q\n' "$ABROAD_SSH_USER"
+        printf 'TARGET_PORT=%q\n' "$TARGET_PORT"
+        printf 'PUBLIC_PORT=%q\n' "$PUBLIC_PORT"
+        printf 'EXPECTED_HOST_KEY=%q\n' "$EXPECTED_HOST_KEY"
+    } > "$RELAY_STATE"
+    chmod 600 "$RELAY_STATE"
+}
+
+relay_write_service() {
+    cat > "$RELAY_UNIT" << EOF
+[Unit]
+Description=Reliable encrypted relay to abroad VLESS server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT -p ${ABROAD_SSH_PORT} -i ${RELAY_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${RELAY_KNOWN_HOSTS} -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -L 0.0.0.0:${PUBLIC_PORT}:127.0.0.1:${TARGET_PORT} ${ABROAD_SSH_USER}@${ABROAD_IP}
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$RELAY_UNIT"
+    systemctl daemon-reload
+}
+
+relay_ensure_ssh_forwarding() {
+    local forwarding
+    forwarding=$(sshd -T 2>/dev/null | awk '$1=="allowtcpforwarding" {print $2; exit}')
+    case "$forwarding" in
+        yes|local) return 0 ;;
+    esac
+
+    print_step "Enabling local SSH port forwarding for the relay..."
+    install -d -m 755 /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/90-paqet-relay.conf <<'EOF'
+# Required by paqet-tunnel reliable relay mode.
+# "local" permits -L forwarding but not remote (-R) forwarding.
+AllowTcpForwarding local
+EOF
+    if ! sshd -t; then
+        rm -f /etc/ssh/sshd_config.d/90-paqet-relay.conf
+        print_error "The SSH configuration test failed; forwarding was not enabled."
+        return 1
+    fi
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    print_success "Local SSH forwarding enabled"
+}
+
+relay_setup_abroad() {
+    print_header "Reliable relay — Abroad server"
+    local detected_ip default_user ssh_port target_port host_key server_code
+    detected_ip=$(get_public_ip)
+    default_user="${SUDO_USER:-ubuntu}"
+    [ "$default_user" = "root" ] && getent passwd ubuntu >/dev/null 2>&1 && default_user="ubuntu"
+
+    read_ip "Public IP of this abroad server" detected_ip "$detected_ip"
+    relay_read_required "SSH login user allowed to receive the relay" default_user "$default_user"
+    while ! relay_valid_user "$default_user" || ! getent passwd "$default_user" >/dev/null 2>&1; do
+        print_error "That local user does not exist or is invalid."
+        relay_read_required "SSH login user" default_user "ubuntu"
+    done
+    ssh_port=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}')
+    read_port "SSH port" ssh_port "${ssh_port:-22}"
+    read_port "VLESS/Xray port on this server" target_port "27111"
+
+    if ! ss -lnt 2>/dev/null | grep -qE "[:.]${target_port}[[:space:]]"; then
+        print_warning "Nothing is listening on TCP port ${target_port} yet. The relay can be paired, but clients will not work until Xray listens there."
+    else
+        print_success "A service is listening on TCP port ${target_port}"
+    fi
+
+    if [ ! -s /etc/ssh/ssh_host_ed25519_key.pub ]; then
+        ssh-keygen -A
+    fi
+    relay_ensure_ssh_forwarding || return 1
+    host_key=$(awk '{print $1, $2}' /etc/ssh/ssh_host_ed25519_key.pub)
+
+    install -d -m 700 "$RELAY_DIR"
+    {
+        printf 'RELAY_ABROAD_USER=%q\n' "$default_user"
+        printf 'RELAY_TARGET_PORT=%q\n' "$target_port"
+        printf 'RELAY_SSH_PORT=%q\n' "$ssh_port"
+    } > "${RELAY_DIR}/abroad.conf"
+    chmod 600 "${RELAY_DIR}/abroad.conf"
+
+    server_code=$(relay_encode_server_code "$detected_ip" "$ssh_port" "$default_user" "$target_port" "$host_key")
+    echo ""
+    print_success "Abroad side is ready"
+    echo -e "${YELLOW}Copy this code to the Iran installer:${NC}"
+    echo "$server_code"
+    echo ""
+    print_info "Next on Iran: choose Reliable SSH relay → Configure Iran server."
+}
+
+relay_setup_iran() {
+    print_header "Reliable relay — Iran server"
+    local server_code scanned_key public_key key_code tag known_host_label
+    relay_read_required "Paste the relay:// code from the abroad server" server_code
+    if ! relay_decode_server_code "$server_code"; then
+        print_error "Invalid relay server code"
+        return 1
+    fi
+
+    ABROAD_IP="$RELAY_CODE_HOST"
+    ABROAD_SSH_PORT="$RELAY_CODE_SSH_PORT"
+    ABROAD_SSH_USER="$RELAY_CODE_SSH_USER"
+    TARGET_PORT="$RELAY_CODE_TARGET_PORT"
+    EXPECTED_HOST_KEY="$RELAY_CODE_HOST_KEY"
+    read_port "Public port clients use on this Iran server" PUBLIC_PORT "$TARGET_PORT"
+
+    command -v ssh >/dev/null 2>&1 || { print_error "OpenSSH client is required"; return 1; }
+    install -d -m 700 /root/.ssh "$RELAY_DIR"
+    if [ ! -s "$RELAY_KEY" ]; then
+        ssh-keygen -q -t ed25519 -N "" -C "paqet-relay-$(hostname)" -f "$RELAY_KEY"
+    fi
+    chmod 600 "$RELAY_KEY"
+    chmod 644 "${RELAY_KEY}.pub"
+
+    scanned_key=$(ssh-keyscan -T 10 -p "$ABROAD_SSH_PORT" -t ed25519 "$ABROAD_IP" 2>/dev/null | awk 'NF >= 3 {print $2, $3; exit}')
+    if [ -z "$scanned_key" ]; then
+        print_error "Could not read the SSH host key from ${ABROAD_IP}:${ABROAD_SSH_PORT}"
+        return 1
+    fi
+    if [ "$scanned_key" != "$EXPECTED_HOST_KEY" ]; then
+        print_error "SSH host fingerprint does not match the abroad setup code."
+        print_info "Do not continue: the IP may point to a different server. Generate a fresh code on the intended abroad VPS."
+        return 1
+    fi
+    known_host_label=$(relay_known_host_label "$ABROAD_IP" "$ABROAD_SSH_PORT")
+    printf '%s %s\n' "$known_host_label" "$EXPECTED_HOST_KEY" > "$RELAY_KNOWN_HOSTS"
+    chmod 600 "$RELAY_KNOWN_HOSTS"
+
+    relay_write_state
+    relay_write_service
+    systemctl enable "$RELAY_SERVICE" >/dev/null 2>&1
+    systemctl restart "$RELAY_SERVICE" || true
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw allow "${PUBLIC_PORT}/tcp" >/dev/null
+        print_success "Allowed ${PUBLIC_PORT}/tcp in UFW"
+    fi
+
+    public_key=$(cat "${RELAY_KEY}.pub")
+    tag="paqet-relay-$(hostname | tr -c 'A-Za-z0-9._-' '-')"
+    key_code=$(relay_encode_key_code "$public_key" "$TARGET_PORT" "$tag")
+    echo ""
+    print_success "Iran relay service installed and enabled"
+    echo -e "${YELLOW}Copy this code back to the abroad installer:${NC}"
+    echo "$key_code"
+    echo ""
+    print_info "On abroad: choose Reliable SSH relay → Authorize Iran server."
+    print_info "The Iran service retries automatically; no second setup run is needed."
+}
+
+relay_authorize_iran() {
+    print_header "Reliable relay — Authorize Iran server"
+    local key_code relay_user authorized_keys temp_file key_blob line
+    relay_read_required "Paste the relay-key:// code from the Iran server" key_code
+    if ! relay_decode_key_code "$key_code"; then
+        print_error "Invalid Iran relay key code"
+        return 1
+    fi
+
+    relay_user="${SUDO_USER:-ubuntu}"
+    if [ -s "${RELAY_DIR}/abroad.conf" ]; then
+        # This file is created by this root-only installer and contains quoted values.
+        source "${RELAY_DIR}/abroad.conf"
+        relay_user="${RELAY_ABROAD_USER:-$relay_user}"
+        if [ -n "${RELAY_TARGET_PORT:-}" ] && [ "$RELAY_CODE_TARGET_PORT" != "$RELAY_TARGET_PORT" ]; then
+            print_error "Pairing code requests port ${RELAY_CODE_TARGET_PORT}, but this abroad server was configured for ${RELAY_TARGET_PORT}."
+            return 1
+        fi
+    fi
+    [ "$relay_user" = "root" ] && getent passwd ubuntu >/dev/null 2>&1 && relay_user="ubuntu"
+    relay_read_required "SSH user that receives the relay" relay_user "$relay_user"
+    if ! relay_valid_user "$relay_user" || ! getent passwd "$relay_user" >/dev/null 2>&1; then
+        print_error "Invalid or missing local SSH user: $relay_user"
+        return 1
+    fi
+
+    authorized_keys=$(getent passwd "$relay_user" | cut -d: -f6)/.ssh/authorized_keys
+    install -d -m 700 -o "$relay_user" -g "$(id -gn "$relay_user")" "$(dirname "$authorized_keys")"
+    touch "$authorized_keys"
+    cp -a "$authorized_keys" "${authorized_keys}.before-paqet-relay-$(date -u +%Y%m%dT%H%M%SZ)"
+    key_blob=$(printf '%s' "$RELAY_CODE_PUBLIC_KEY" | awk '{print $2}')
+    # The forced command blocks shell/command use of this key. The Iran client
+    # runs ssh -N (no session channel), so forwarding remains available.
+    line="command=\"/bin/false\",no-agent-forwarding,no-X11-forwarding,no-pty,no-user-rc,permitopen=\"127.0.0.1:${RELAY_CODE_TARGET_PORT}\" ssh-ed25519 ${key_blob} ${RELAY_CODE_TAG}"
+    temp_file=$(mktemp "${authorized_keys}.tmp.XXXXXX")
+    awk -v blob="$key_blob" -v tag="$RELAY_CODE_TAG" 'index($0,blob)==0 && index($0,tag)==0 {print}' "$authorized_keys" > "$temp_file"
+    printf '%s\n' "$line" >> "$temp_file"
+    mv "$temp_file" "$authorized_keys"
+    chown "$relay_user:$(id -gn "$relay_user")" "$authorized_keys"
+    chmod 600 "$authorized_keys"
+
+    relay_ensure_ssh_forwarding || return 1
+
+    print_success "Iran relay key authorized for 127.0.0.1:${RELAY_CODE_TARGET_PORT} only"
+    print_info "The Iran relay should connect automatically within a few seconds."
+}
+
+relay_update_abroad_ip() {
+    print_header "Reliable relay — Change abroad IP"
+    if [ ! -s "$RELAY_STATE" ]; then
+        print_error "No Iran relay state found. Run Configure Iran server first."
+        return 1
+    fi
+    source "$RELAY_STATE"
+    local old_ip="$ABROAD_IP" new_ip scanned_key known_host_label
+    read_ip "New abroad public IP" new_ip
+    scanned_key=$(ssh-keyscan -T 10 -p "$ABROAD_SSH_PORT" -t ed25519 "$new_ip" 2>/dev/null | awk 'NF >= 3 {print $2, $3; exit}')
+    if [ -z "$scanned_key" ]; then
+        print_error "Cannot reach SSH on ${new_ip}:${ABROAD_SSH_PORT}"
+        return 1
+    fi
+    if [ "$scanned_key" != "$EXPECTED_HOST_KEY" ]; then
+        print_error "The new IP has a different SSH host fingerprint."
+        print_info "If this is a replacement VPS, run the Abroad setup there and paste its new relay:// code into Configure Iran server."
+        return 1
+    fi
+
+    cp -a "$RELAY_STATE" "${RELAY_STATE}.before-ip-change-$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a "$RELAY_UNIT" "${RELAY_UNIT}.before-ip-change-$(date -u +%Y%m%dT%H%M%SZ)"
+    ABROAD_IP="$new_ip"
+    known_host_label=$(relay_known_host_label "$ABROAD_IP" "$ABROAD_SSH_PORT")
+    printf '%s %s\n' "$known_host_label" "$EXPECTED_HOST_KEY" > "$RELAY_KNOWN_HOSTS"
+    chmod 600 "$RELAY_KNOWN_HOSTS"
+    relay_write_state
+    relay_write_service
+    systemctl restart "$RELAY_SERVICE"
+    sleep 2
+    print_success "Abroad IP changed: ${old_ip} → ${new_ip}"
+    relay_status
+}
+
+relay_status() {
+    print_header "Reliable relay status"
+    if [ ! -s "$RELAY_STATE" ]; then
+        print_info "Iran relay is not configured on this host."
+        return 0
+    fi
+    source "$RELAY_STATE"
+    echo -e "  Abroad: ${CYAN}${ABROAD_IP}:${ABROAD_SSH_PORT}${NC}"
+    echo -e "  Client endpoint: ${CYAN}$(get_public_ip):${PUBLIC_PORT}${NC}"
+    if systemctl is-active --quiet "$RELAY_SERVICE" && ss -lnt 2>/dev/null | grep -qE "[:.]${PUBLIC_PORT}[[:space:]]"; then
+        print_success "Relay is active and listening on port ${PUBLIC_PORT}"
+    else
+        print_error "Relay is not connected"
+        systemctl status "$RELAY_SERVICE" --no-pager -l 2>/dev/null | tail -n 8 || true
+        return 1
+    fi
+}
+
+relay_menu() {
+    while true; do
+        print_banner
+        echo -e "${YELLOW}Reliable SSH relay${NC}"
+        echo ""
+        echo -e "  ${CYAN}1)${NC} Abroad: generate setup code"
+        echo -e "  ${CYAN}2)${NC} Iran: configure from setup code"
+        echo -e "  ${CYAN}3)${NC} Abroad: authorize Iran pairing code"
+        echo -e "  ${CYAN}4)${NC} Iran: change abroad IP only"
+        echo -e "  ${CYAN}5)${NC} Iran: show relay status"
+        echo -e "  ${CYAN}0)${NC} Back"
+        echo ""
+        read -p "Choice: " relay_choice < /dev/tty
+        case "$relay_choice" in
+            1) relay_setup_abroad ;;
+            2) relay_setup_iran ;;
+            3) relay_authorize_iran ;;
+            4) relay_update_abroad_ip ;;
+            5) relay_status ;;
+            0) return 0 ;;
+            *) print_error "Invalid choice" ;;
+        esac
+        echo ""
+        echo -e "${YELLOW}Press Enter to continue...${NC}"
+        read < /dev/tty
+    done
+}
+
 run_setup_server_b() {
     local host_role=$(detect_host_role)
     if [ "$host_role" = "client" ]; then
@@ -4084,10 +4734,31 @@ run_manage_menu() {
 
 main() {
     # Parse command line arguments
+    local relay_action=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --offline)
                 OFFLINE_MODE=true
+                shift
+                ;;
+            --relay-abroad)
+                relay_action="abroad"
+                shift
+                ;;
+            --relay-iran)
+                relay_action="iran"
+                shift
+                ;;
+            --relay-authorize)
+                relay_action="authorize"
+                shift
+                ;;
+            --relay-update-ip)
+                relay_action="update-ip"
+                shift
+                ;;
+            --relay-status)
+                relay_action="status"
                 shift
                 ;;
             *)
@@ -4097,6 +4768,15 @@ main() {
     done
 
     check_root
+
+    # Direct actions make repeat setup possible without navigating the menu.
+    case "$relay_action" in
+        abroad) relay_setup_abroad; return ;;
+        iran) relay_setup_iran; return ;;
+        authorize) relay_authorize_iran; return ;;
+        update-ip) relay_update_abroad_ip; return ;;
+        status) relay_status; return ;;
+    esac
 
     # Auto-sync: if paqet-tunnel command exists but is outdated, update it silently
     if is_command_installed; then
@@ -4136,6 +4816,7 @@ main() {
             echo -e "  ${CYAN}2)${NC} Iran entry server (A) — the IP your clients connect to"
             echo ""
             echo -e "  ${GREEN}── Other ──${NC}"
+            echo -e "  ${CYAN}s)${NC} Reliable SSH relay (recommended when raw paqet is filtered)"
             echo -e "  ${CYAN}f)${NC} IPTables Port Forwarding (relay/NAT, no paqet)"
             if ! is_command_installed; then
                 echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
@@ -4175,6 +4856,7 @@ main() {
             esac
             echo ""
             echo -e "  ${GREEN}── Maintenance ──${NC}"
+            echo -e "  ${CYAN}s)${NC} Reliable SSH relay (setup / pair / change IP)"
             echo -e "  ${CYAN}8)${NC} Check for Updates"
             echo -e "  ${CYAN}9)${NC} Show Port Defaults"
             echo -e "  ${CYAN}a)${NC} Automatic Reset (scheduled restart)"
@@ -4219,6 +4901,7 @@ main() {
             9) show_port_config ;;
             [Aa]) auto_reset_menu ;;
             [Dd]) apply_connection_protection ;;
+            [Ss]) relay_menu ;;
             [Ff]) iptables_port_forwarding_menu ;;
             [Uu]) uninstall ;;
             [Ii]) install_command ;;
